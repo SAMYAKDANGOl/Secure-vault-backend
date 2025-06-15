@@ -6,9 +6,6 @@ const crypto = require("crypto")
 
 const router = express.Router()
 
-// In-memory storage for uploaded files (in production, use a database)
-const uploadedFiles = []
-
 // Test endpoint to verify route is working
 router.get("/test", async (req, res) => {
   console.log(`[${req.requestId}] Files test endpoint accessed`)
@@ -40,14 +37,6 @@ const fileValidator = {
       console.error("Hash calculation error:", error)
       throw error
     }
-  },
-}
-
-// Simplified audit logger for debugging
-const auditLogger = {
-  log: async (entry) => {
-    console.log("Audit log:", entry)
-    return Promise.resolve()
   },
 }
 
@@ -93,28 +82,52 @@ const upload = multer({
 // Get all files for user
 router.get("/", async (req, res) => {
   try {
-    console.log(`[${req.requestId}] Getting files for user:`, req.user.id)
+    const supabase = req.app.locals.supabase
+    const userId = req.user.id
+    console.log(`[${req.requestId}] Getting files for user:`, userId)
 
-    // Filter files for the current user
-    const userFiles = uploadedFiles.filter((file) => file.userId === req.user.id)
+    // Get files from Supabase
+    const { data: files, error } = await supabase
+      .from("files")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("deleted", false)
+      .order("created_at", { ascending: false })
 
-    console.log(`[${req.requestId}] Found ${userFiles.length} files for user`)
-    console.log(
-      `[${req.requestId}] Files:`,
-      userFiles.map((f) => ({ id: f.id, name: f.name, size: f.size })),
-    )
+    if (error) {
+      console.error(`[${req.requestId}] Supabase error:`, error)
+      throw error
+    }
 
-    await auditLogger.log({
-      userId: req.user.id,
+    console.log(`[${req.requestId}] Found ${files.length} files for user`)
+
+    // Transform file data for frontend
+    const transformedFiles = files.map((file) => ({
+      id: file.id,
+      name: file.original_name,
+      size: file.size,
+      type: file.mime_type,
+      uploadedAt: file.created_at,
+      encrypted: file.encrypted,
+      shared: file.shared,
+      accessControl: file.access_control,
+      downloadCount: file.download_count,
+      lastAccessed: file.last_accessed,
+    }))
+
+    // Log audit
+    await supabase.from("audit_logs").insert({
+      user_id: userId,
       action: "files_list",
       resource: "/files",
-      ipAddress: req.clientIP,
-      userAgent: req.get("User-Agent"),
+      ip_address: req.clientIP,
+      user_agent: req.get("User-Agent"),
       success: true,
-      details: { count: userFiles.length },
+      details: { count: files.length },
+      created_at: new Date().toISOString(),
     })
 
-    res.json({ data: userFiles })
+    res.json({ data: transformedFiles })
   } catch (error) {
     console.error(`[${req.requestId}] Failed to fetch files:`, error)
     res.status(500).json({ error: "Failed to fetch files" })
@@ -146,6 +159,7 @@ router.post(
         path: req.file.path,
       })
 
+      const supabase = req.app.locals.supabase
       const userId = req.user.id
       const uploadOptions = JSON.parse(req.body.options || "{}")
 
@@ -156,58 +170,85 @@ router.post(
       const fileHash = await fileValidator.calculateHash(req.file.path)
       console.log(`[${req.requestId}] File hash:`, fileHash)
 
-      // Create file record
-      const fileRecord = {
-        id: crypto.randomUUID(),
-        userId: userId,
-        name: req.file.originalname,
-        size: req.file.size,
-        type: req.file.mimetype,
-        uploadedAt: new Date().toISOString(),
-        encrypted: uploadOptions.encryption || false,
-        shared: false,
-        downloadCount: 0,
-        lastAccessed: null,
-        filePath: req.file.path,
-        filename: req.file.filename,
-        hash: fileHash,
-        accessControl: uploadOptions.accessControl || {},
+      // Upload file to Supabase Storage
+      const fileBuffer = await fs.readFile(req.file.path)
+      const fileExt = path.extname(req.file.originalname)
+      const fileName = `${userId}/${crypto.randomUUID()}${fileExt}`
+
+      const { data: storageData, error: storageError } = await supabase.storage
+        .from("secure-files")
+        .upload(fileName, fileBuffer, {
+          contentType: req.file.mimetype,
+          cacheControl: "3600",
+        })
+
+      if (storageError) {
+        console.error(`[${req.requestId}] Storage error:`, storageError)
+        throw storageError
       }
 
-      // Store in memory (in production, save to database)
-      uploadedFiles.push(fileRecord)
+      console.log(`[${req.requestId}] File uploaded to storage:`, storageData.path)
+
+      // Create file record in database
+      const { data: fileRecord, error: dbError } = await supabase
+        .from("files")
+        .insert({
+          user_id: userId,
+          original_name: req.file.originalname,
+          stored_name: fileName,
+          size: req.file.size,
+          mime_type: req.file.mimetype,
+          encrypted: uploadOptions.encryption || false,
+          encryption_key: uploadOptions.encryption ? crypto.randomBytes(32).toString("hex") : null,
+          file_hash: fileHash,
+          shared: false,
+          access_control: uploadOptions.accessControl || null,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .select()
+        .single()
+
+      if (dbError) {
+        console.error(`[${req.requestId}] Database error:`, dbError)
+        throw dbError
+      }
 
       console.log(`[${req.requestId}] File record created:`, {
         id: fileRecord.id,
-        name: fileRecord.name,
+        name: fileRecord.original_name,
         size: fileRecord.size,
-        userId: fileRecord.userId,
       })
 
-      await auditLogger.log({
-        userId,
+      // Log audit
+      await supabase.from("audit_logs").insert({
+        user_id: userId,
         action: "file_upload",
         resource: `/files/${fileRecord.id}`,
-        ipAddress: req.clientIP,
-        userAgent: req.get("User-Agent"),
+        ip_address: req.clientIP,
+        user_agent: req.get("User-Agent"),
         success: true,
         details: {
           filename: req.file.originalname,
           size: req.file.size,
           encrypted: uploadOptions.encryption || false,
         },
+        created_at: new Date().toISOString(),
       })
 
+      // Clean up local file
+      await fs.unlink(req.file.path)
+      console.log(`[${req.requestId}] Local file deleted:`, req.file.path)
+
       console.log(`[${req.requestId}] Upload successful`)
-      console.log(`[${req.requestId}] Total files in system:`, uploadedFiles.length)
 
       res.json({
         success: true,
         file: {
           id: fileRecord.id,
-          name: fileRecord.name,
+          name: fileRecord.original_name,
           size: fileRecord.size,
-          type: fileRecord.type,
+          type: fileRecord.mime_type,
         },
       })
     } catch (error) {
@@ -235,48 +276,69 @@ router.post(
 // Download endpoint
 router.get("/:id/download", async (req, res) => {
   try {
-    console.log(`[${req.requestId}] Download request for file:`, req.params.id)
+    const supabase = req.app.locals.supabase
+    const userId = req.user.id
+    const fileId = req.params.id
 
-    // Find the file
-    const file = uploadedFiles.find((f) => f.id === req.params.id && f.userId === req.user.id)
+    console.log(`[${req.requestId}] Download request for file:`, fileId)
 
-    if (!file) {
-      console.log(`[${req.requestId}] File not found:`, req.params.id)
+    // Get file metadata from database
+    const { data: file, error: dbError } = await supabase
+      .from("files")
+      .select("*")
+      .eq("id", fileId)
+      .eq("user_id", userId)
+      .eq("deleted", false)
+      .single()
+
+    if (dbError || !file) {
+      console.log(`[${req.requestId}] File not found:`, fileId)
       return res.status(404).json({ error: "File not found" })
     }
 
-    console.log(`[${req.requestId}] Found file:`, file.name)
+    console.log(`[${req.requestId}] Found file:`, file.original_name)
 
-    // Check if file exists on disk
-    try {
-      await fs.access(file.filePath)
-    } catch (error) {
-      console.log(`[${req.requestId}] File not found on disk:`, file.filePath)
-      return res.status(404).json({ error: "File not found on disk" })
+    // Download file from storage
+    const { data: fileData, error: storageError } = await supabase.storage
+      .from("secure-files")
+      .download(file.stored_name)
+
+    if (storageError) {
+      console.error(`[${req.requestId}] Storage error:`, storageError)
+      throw storageError
     }
 
-    // Update download count
-    file.downloadCount = (file.downloadCount || 0) + 1
-    file.lastAccessed = new Date().toISOString()
+    // Update download count and last accessed
+    await supabase
+      .from("files")
+      .update({
+        download_count: (file.download_count || 0) + 1,
+        last_accessed: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", fileId)
+
+    // Log audit
+    await supabase.from("audit_logs").insert({
+      user_id: userId,
+      action: "file_download",
+      resource: `/files/${fileId}`,
+      ip_address: req.clientIP,
+      user_agent: req.get("User-Agent"),
+      success: true,
+      details: { filename: file.original_name },
+      created_at: new Date().toISOString(),
+    })
+
+    // Set response headers
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(file.original_name)}"`)
+    res.setHeader("Content-Type", file.mime_type)
 
     // Send file
-    res.download(file.filePath, file.name, (err) => {
-      if (err) {
-        console.error(`[${req.requestId}] Download error:`, err)
-      } else {
-        console.log(`[${req.requestId}] Download successful:`, file.name)
-      }
-    })
+    const buffer = await fileData.arrayBuffer()
+    res.send(Buffer.from(buffer))
 
-    await auditLogger.log({
-      userId: req.user.id,
-      action: "file_download",
-      resource: `/files/${req.params.id}`,
-      ipAddress: req.clientIP,
-      userAgent: req.get("User-Agent"),
-      success: true,
-      details: { filename: file.name },
-    })
+    console.log(`[${req.requestId}] Download successful:`, file.original_name)
   } catch (error) {
     console.error(`[${req.requestId}] Download error:`, error)
     res.status(500).json({ error: "Download failed" })
@@ -286,41 +348,51 @@ router.get("/:id/download", async (req, res) => {
 // Delete file
 router.delete("/:id", async (req, res) => {
   try {
-    console.log(`[${req.requestId}] Delete request for file:`, req.params.id)
+    const supabase = req.app.locals.supabase
+    const userId = req.user.id
+    const fileId = req.params.id
 
-    // Find the file
-    const fileIndex = uploadedFiles.findIndex((f) => f.id === req.params.id && f.userId === req.user.id)
+    console.log(`[${req.requestId}] Delete request for file:`, fileId)
 
-    if (fileIndex === -1) {
-      console.log(`[${req.requestId}] File not found for deletion:`, req.params.id)
+    // Get file metadata
+    const { data: file, error: dbError } = await supabase
+      .from("files")
+      .select("*")
+      .eq("id", fileId)
+      .eq("user_id", userId)
+      .eq("deleted", false)
+      .single()
+
+    if (dbError || !file) {
+      console.log(`[${req.requestId}] File not found for deletion:`, fileId)
       return res.status(404).json({ error: "File not found" })
     }
 
-    const file = uploadedFiles[fileIndex]
-    console.log(`[${req.requestId}] Deleting file:`, file.name)
+    console.log(`[${req.requestId}] Deleting file:`, file.original_name)
 
-    // Delete from disk
-    try {
-      await fs.unlink(file.filePath)
-      console.log(`[${req.requestId}] File deleted from disk:`, file.filePath)
-    } catch (error) {
-      console.warn(`[${req.requestId}] Could not delete file from disk:`, error.message)
-    }
+    // Soft delete in database
+    await supabase
+      .from("files")
+      .update({
+        deleted: true,
+        deleted_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", fileId)
 
-    // Remove from memory
-    uploadedFiles.splice(fileIndex, 1)
-
-    await auditLogger.log({
-      userId: req.user.id,
+    // Log audit
+    await supabase.from("audit_logs").insert({
+      user_id: userId,
       action: "file_delete",
-      resource: `/files/${req.params.id}`,
-      ipAddress: req.clientIP,
-      userAgent: req.get("User-Agent"),
+      resource: `/files/${fileId}`,
+      ip_address: req.clientIP,
+      user_agent: req.get("User-Agent"),
       success: true,
-      details: { filename: file.name },
+      details: { filename: file.original_name },
+      created_at: new Date().toISOString(),
     })
 
-    console.log(`[${req.requestId}] File deleted successfully:`, file.name)
+    console.log(`[${req.requestId}] File deleted successfully:`, file.original_name)
     res.json({ success: true, message: "File deleted successfully" })
   } catch (error) {
     console.error(`[${req.requestId}] Delete error:`, error)
@@ -331,11 +403,22 @@ router.delete("/:id", async (req, res) => {
 // Share file
 router.post("/:id/share", async (req, res) => {
   try {
-    console.log(`[${req.requestId}] Share request for file:`, req.params.id)
+    const supabase = req.app.locals.supabase
+    const userId = req.user.id
+    const fileId = req.params.id
 
-    const file = uploadedFiles.find((f) => f.id === req.params.id && f.userId === req.user.id)
+    console.log(`[${req.requestId}] Share request for file:`, fileId)
 
-    if (!file) {
+    // Get file metadata
+    const { data: file, error: dbError } = await supabase
+      .from("files")
+      .select("*")
+      .eq("id", fileId)
+      .eq("user_id", userId)
+      .eq("deleted", false)
+      .single()
+
+    if (dbError || !file) {
       return res.status(404).json({ error: "File not found" })
     }
 
@@ -343,12 +426,38 @@ router.post("/:id/share", async (req, res) => {
     const shareToken = crypto.randomBytes(32).toString("hex")
     const shareUrl = `${process.env.FRONTEND_URL}/shared/${shareToken}`
 
-    // Mark file as shared
-    file.shared = true
-    file.shareToken = shareToken
-    file.shareOptions = req.body
+    // Update file with share info
+    await supabase
+      .from("files")
+      .update({
+        shared: true,
+        share_token: shareToken,
+        share_expires_at: req.body.expirationDate ? new Date(req.body.expirationDate).toISOString() : null,
+        access_control: {
+          ...file.access_control,
+          shareOptions: req.body,
+        },
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", fileId)
 
-    console.log(`[${req.requestId}] File shared:`, file.name)
+    console.log(`[${req.requestId}] File shared:`, file.original_name)
+
+    // Log audit
+    await supabase.from("audit_logs").insert({
+      user_id: userId,
+      action: "file_share",
+      resource: `/files/${fileId}`,
+      ip_address: req.clientIP,
+      user_agent: req.get("User-Agent"),
+      success: true,
+      details: {
+        filename: file.original_name,
+        shareToken: shareToken,
+        expirationDate: req.body.expirationDate || null,
+      },
+      created_at: new Date().toISOString(),
+    })
 
     res.json({
       success: true,
@@ -365,24 +474,51 @@ router.post("/:id/share", async (req, res) => {
 // Preview endpoint
 router.get("/:id/preview", async (req, res) => {
   try {
-    console.log(`[${req.requestId}] Preview request for file:`, req.params.id)
+    const supabase = req.app.locals.supabase
+    const userId = req.user.id
+    const fileId = req.params.id
 
-    const file = uploadedFiles.find((f) => f.id === req.params.id && f.userId === req.user.id)
+    console.log(`[${req.requestId}] Preview request for file:`, fileId)
 
-    if (!file) {
+    // Get file metadata
+    const { data: file, error: dbError } = await supabase
+      .from("files")
+      .select("*")
+      .eq("id", fileId)
+      .eq("user_id", userId)
+      .eq("deleted", false)
+      .single()
+
+    if (dbError || !file) {
       return res.status(404).json({ error: "File not found" })
     }
 
     // Check if file type supports preview
     const previewableTypes = ["image/", "text/", "application/pdf"]
-    const canPreview = previewableTypes.some((type) => file.type.startsWith(type))
+    const canPreview = previewableTypes.some((type) => file.mime_type.startsWith(type))
 
     if (!canPreview) {
       return res.status(400).json({ error: "File type not supported for preview" })
     }
 
+    // Download file from storage
+    const { data: fileData, error: storageError } = await supabase.storage
+      .from("secure-files")
+      .download(file.stored_name)
+
+    if (storageError) {
+      console.error(`[${req.requestId}] Storage error:`, storageError)
+      throw storageError
+    }
+
+    // Set response headers
+    res.setHeader("Content-Type", file.mime_type)
+
     // Send file for preview
-    res.sendFile(path.resolve(file.filePath))
+    const buffer = await fileData.arrayBuffer()
+    res.send(Buffer.from(buffer))
+
+    console.log(`[${req.requestId}] Preview successful:`, file.original_name)
   } catch (error) {
     console.error(`[${req.requestId}] Preview error:`, error)
     res.status(500).json({ error: "Preview failed" })
