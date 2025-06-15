@@ -1,19 +1,93 @@
-const express = require("express")
-const cors = require("cors")
-const helmet = require("helmet")
-const rateLimit = require("express-rate-limit")
-const compression = require("compression")
-const morgan = require("morgan")
-const path = require("path")
-const fs = require("fs").promises
-const { createClient } = require("@supabase/supabase-js")
-require("dotenv").config()
+import crypto from 'crypto'
+import dotenv from 'dotenv'
+import path from 'path'
+import { fileURLToPath } from 'url'
+
+// Configure environment variables first
+dotenv.config()
+
+// Debug logging
+console.log('Environment variables loaded:')
+console.log('SUPABASE_URL:', process.env.SUPABASE_URL)
+console.log('SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? 'Present' : 'Missing')
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
+// Now import other modules that might use environment variables
+import { createClient } from '@supabase/supabase-js'
+import compression from 'compression'
+import cors from 'cors'
+import express from 'express'
+import rateLimit from 'express-rate-limit'
+import helmet from 'helmet'
+import morgan from 'morgan'
 
 // Initialize Supabase client
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  console.error('Missing required environment variables:')
+  console.error('SUPABASE_URL:', process.env.SUPABASE_URL ? 'Present' : 'Missing')
+  console.error('SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? 'Present' : 'Missing')
+  process.exit(1)
+}
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 )
+
+// Test database connection
+const testConnection = async () => {
+  try {
+    const { data, error } = await supabase.from('files').select('*').limit(1);
+    if (error) throw error;
+    console.log('✅ Database connection successful');
+  } catch (error) {
+    console.error('❌ Database connection failed:', error.message);
+    process.exit(1);
+  }
+};
+
+// Run connection test
+testConnection();
+
+// Verify database connection and schema
+(async () => {
+  try {
+    // Test the connection with a simple query
+    const { data, error } = await supabase
+      .from('files')
+      .select('id')
+      .limit(1);
+
+    if (error) {
+      console.error('Database connection test failed:', error);
+    } else {
+      console.log('Database connection successful');
+    }
+
+    // Check if encryption columns exist
+    const { data: columns, error: columnsError } = await supabase.rpc('get_table_columns', {
+      p_table_name: 'files'
+    });
+
+    if (columnsError) {
+      console.warn('Could not check table columns:', columnsError);
+    } else {
+      const hasEncryptionColumns = columns.some(col => 
+        ['encryption_metadata', 'encryption_key', 'file_hash'].includes(col.column_name)
+      );
+      
+      if (!hasEncryptionColumns) {
+        console.warn('Encryption columns not found in files table. Please run the migration script.');
+      } else {
+        console.log('Encryption columns verified');
+      }
+    }
+  } catch (error) {
+    console.error('Database initialization error:', error);
+  }
+})();
 
 const app = express()
 const PORT = process.env.PORT || 5000
@@ -39,10 +113,10 @@ app.use(
   }),
 )
 
-// Rate limiting
+// Rate limiting (development: high limit)
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
+  max: 1000, // allow 1000 requests per windowMs for development
   message: "Too many requests from this IP, please try again later.",
   standardHeaders: true,
   legacyHeaders: false,
@@ -58,7 +132,7 @@ const authLimiter = rateLimit({
 app.use("/api/auth", authLimiter)
 app.use("/api", limiter)
 
-// CORS configuration
+// CORS configuration (development: allow localhost:3000)
 app.use(
   cors({
     origin: process.env.FRONTEND_URL || "http://localhost:3000",
@@ -72,17 +146,20 @@ app.use(
 app.use(compression())
 
 // Body parsing
-app.use(express.json({ limit: "10mb" }))
-app.use(express.urlencoded({ extended: true, limit: "10mb" }))
+app.use(express.json({ limit: "50mb" }))
+app.use(express.urlencoded({ extended: true, limit: "50mb" }))
 
 // Security middleware
 app.use((req, res, next) => {
   req.clientIP = req.headers["x-forwarded-for"] || req.headers["x-real-ip"] || req.connection.remoteAddress || req.ip
   req.requestId = Math.random().toString(36).substr(2, 9)
   req.deviceFingerprint = req.headers["user-agent"] ? 
-    require('crypto').createHash('sha256').update(req.headers["user-agent"]).digest('hex') : 
+    crypto.createHash('sha256').update(req.headers["user-agent"]).digest('hex') : 
     "unknown-device"
 
+  // Add CORS headers for file downloads
+  res.header('Access-Control-Expose-Headers', 'Content-Disposition, Content-Type, Content-Length');
+  
   console.log(`[${req.requestId}] ${req.method} ${req.path} from ${req.clientIP}`)
   next()
 })
@@ -159,13 +236,20 @@ const authMiddleware = async (req, res, next) => {
   }
 }
 
-// Routes
-app.use("/api/auth", require("./routes/auth"))
-app.use("/api/files", authMiddleware, require("./routes/files"))
-app.use("/api/stats", authMiddleware, require("./routes/stats"))
-app.use("/api/access-control", authMiddleware, require("./routes/access-control"))
-app.use("/api/audit", authMiddleware, require("./routes/audit"))
-app.use("/api/user", authMiddleware, require("./routes/user"))
+// Import routes
+import authRoutes from './routes/auth.js'
+import fileRoutes from './routes/files.js'
+import statsRoutes from './routes/stats.js'
+import userRoutes from './routes/users.js'
+
+// Mount routes
+app.use("/api/auth", authRoutes);
+app.use("/api/files", authMiddleware, fileRoutes);
+app.use("/api/users", authMiddleware, userRoutes);
+app.use("/api", authMiddleware, statsRoutes);
+
+// Remove or comment out the inline /api/stats endpoint to avoid conflicts
+// app.get("/api/stats", authMiddleware, async (req, res) => { ... });
 
 // Enhanced error handling
 app.use((err, req, res, next) => {
@@ -227,4 +311,4 @@ app.listen(PORT, () => {
   console.log(`🔌 Connected to Supabase: ${process.env.SUPABASE_URL ? "Yes" : "No"}`)
 })
 
-module.exports = app
+export default app

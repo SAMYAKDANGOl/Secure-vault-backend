@@ -1,8 +1,23 @@
+const dotenv = require('dotenv');
 const crypto = require("crypto")
 const geoip = require("geoip-lite")
 const { createClient } = require("@supabase/supabase-js")
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+// Configure environment variables
+dotenv.config();
+
+// Initialize Supabase client with environment variables
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!supabaseUrl || !supabaseKey) {
+  console.error('Missing required environment variables for security middleware:');
+  console.error('SUPABASE_URL:', supabaseUrl ? 'Present' : 'Missing');
+  console.error('SUPABASE_SERVICE_ROLE_KEY:', supabaseKey ? 'Present' : 'Missing');
+  throw new Error('Missing required environment variables for security middleware');
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 const securityMiddleware = async (req, res, next) => {
   try {

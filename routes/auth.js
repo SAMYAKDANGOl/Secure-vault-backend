@@ -1,180 +1,307 @@
-const express = require("express")
-const bcrypt = require("bcryptjs")
-const crypto = require("crypto")
-const { createClient } = require("@supabase/supabase-js")
-const twilio = require("twilio")
-const auditLogger = require("../utils/audit-logger")
-const authMiddleware = require("../middleware/auth")
+import { createClient } from '@supabase/supabase-js'
+import express from 'express'
+import { authMiddleware } from '../middleware/auth.js'
+import { auditLogger } from '../utils/audit-logger.js'
 
 const router = express.Router()
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
 
-const twilioClient = process.env.TWILIO_ACCOUNT_SID
-  ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
-  : null
-
-// Check if user has 2FA enabled
-router.post("/check-2fa", async (req, res) => {
+// Login
+router.post("/login", async (req, res) => {
   try {
-    const { userId } = req.body
+    const { email, password } = req.body
 
-    const { data: profile } = await supabase
-      .from("user_profiles")
-      .select("two_factor_enabled, phone")
-      .eq("user_id", userId)
-      .single()
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    })
 
-    if (profile?.two_factor_enabled) {
-      // Generate temporary token
-      const tempToken = crypto.randomBytes(32).toString("hex")
+    if (error) throw error
 
-      // Store temp token with expiration
-      await supabase.from("temp_tokens").insert({
-        user_id: userId,
-        token: tempToken,
-        expires_at: new Date(Date.now() + 5 * 60 * 1000), // 5 minutes
-      })
+    await auditLogger.log({
+      userId: data.user.id,
+      action: "login",
+      resource: "/auth/login",
+      ipAddress: req.ip,
+      userAgent: req.get("User-Agent"),
+      success: true,
+    })
 
-      // Send SMS code
-      const code = Math.floor(100000 + Math.random() * 900000).toString()
-
-      await supabase.from("verification_codes").insert({
-        user_id: userId,
-        code: await bcrypt.hash(code, 10),
-        expires_at: new Date(Date.now() + 5 * 60 * 1000),
-      })
-
-      if (twilioClient && profile.phone) {
-        await twilioClient.messages.create({
-          body: `Your Secure Vault verification code is: ${code}`,
-          from: process.env.TWILIO_PHONE_NUMBER,
-          to: profile.phone,
-        })
-      }
-
-      res.json({
-        requiresTwoFactor: true,
-        tempToken,
-        message: "Verification code sent to your phone",
-      })
-    } else {
-      res.json({ requiresTwoFactor: false })
-    }
+    res.json({
+      token: data.session.access_token,
+      user: {
+        id: data.user.id,
+        email: data.user.email,
+        name: data.user.user_metadata?.fullName || data.user.email,
+      },
+    })
   } catch (error) {
-    console.error("2FA check error:", error)
-    res.status(500).json({ error: "Failed to check 2FA status" })
+    console.error("Login error:", error)
+    res.status(401).json({ error: "Invalid email or password" })
   }
 })
 
-// Verify 2FA code
-router.post("/verify-2fa", async (req, res) => {
+// Register
+router.post("/register", async (req, res) => {
   try {
-    const { tempToken, code } = req.body
+    const { email, password } = req.body
 
-    // Verify temp token
-    const { data: tokenData } = await supabase
-      .from("temp_tokens")
-      .select("user_id")
-      .eq("token", tempToken)
-      .gt("expires_at", new Date().toISOString())
-      .single()
-
-    if (!tokenData) {
-      return res.status(400).json({ error: "Invalid or expired token" })
-    }
-
-    // Verify code
-    const { data: codes } = await supabase
-      .from("verification_codes")
-      .select("code")
-      .eq("user_id", tokenData.user_id)
-      .gt("expires_at", new Date().toISOString())
-      .order("created_at", { ascending: false })
-
-    let codeValid = false
-    for (const codeData of codes || []) {
-      if (await bcrypt.compare(code, codeData.code)) {
-        codeValid = true
-        break
-      }
-    }
-
-    if (!codeValid) {
-      await auditLogger.log({
-        userId: tokenData.user_id,
-        action: "2fa_failed",
-        resource: "/auth/verify-2fa",
-        ipAddress: req.clientIP,
-        userAgent: req.get("User-Agent"),
-        success: false,
-      })
-
-      return res.status(400).json({ error: "Invalid verification code" })
-    }
-
-    // Generate new session tokens
-    const { data: authData, error } = await supabase.auth.admin.generateLink({
-      type: "magiclink",
-      email: tokenData.user_id, // This is a workaround for getting tokens
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
     })
 
-    if (error) {
-      throw error
-    }
+    if (error) throw error
 
-    // Clean up temp tokens and codes
-    await supabase.from("temp_tokens").delete().eq("token", tempToken)
-    await supabase.from("verification_codes").delete().eq("user_id", tokenData.user_id)
+    // Create user profile
+    const { error: profileError } = await supabase
+      .from("user_profiles")
+      .insert({
+        user_id: data.user.id,
+        email: data.user.email,
+        active: true,
+        created_at: new Date().toISOString(),
+      })
+
+    if (profileError) throw profileError
 
     await auditLogger.log({
-      userId: tokenData.user_id,
-      action: "2fa_success",
-      resource: "/auth/verify-2fa",
-      ipAddress: req.clientIP,
+      userId: data.user.id,
+      action: "register",
+      resource: "/auth/register",
+      ipAddress: req.ip,
+      userAgent: req.get("User-Agent"),
+      success: true,
+    })
+
+    res.json({
+      token: data.session.access_token,
+      user: {
+        id: data.user.id,
+        email: data.user.email,
+        name: data.user.email,
+      },
+    })
+  } catch (error) {
+    console.error("Registration error:", error)
+    res.status(400).json({ error: "Failed to create account" })
+  }
+})
+
+// Logout
+router.post("/logout", authMiddleware, async (req, res) => {
+  try {
+    const { error } = await supabase.auth.signOut()
+
+    if (error) throw error
+
+    await auditLogger.log({
+      userId: req.user.id,
+      action: "logout",
+      resource: "/auth/logout",
+      ipAddress: req.ip,
+      userAgent: req.get("User-Agent"),
+      success: true,
+    })
+
+    res.json({ success: true })
+  } catch (error) {
+    console.error("Logout error:", error)
+    res.status(500).json({ error: "Failed to logout" })
+  }
+})
+
+// Get current user
+router.get("/me", authMiddleware, async (req, res) => {
+  try {
+    const { data: profile, error } = await supabase
+      .from("user_profiles")
+      .select("*")
+      .eq("user_id", req.user.id)
+      .single()
+
+    if (error) throw error
+
+    res.json({
+      id: req.user.id,
+      email: req.user.email,
+      name: req.user.user_metadata?.fullName || req.user.email,
+      profile,
+    })
+  } catch (error) {
+    console.error("Get user error:", error)
+    res.status(500).json({ error: "Failed to get user data" })
+  }
+})
+
+// Forgot password
+router.post("/forgot-password", async (req, res) => {
+  try {
+    const { email } = req.body
+
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: `${process.env.FRONTEND_URL}/auth/reset-password`,
+    })
+
+    if (error) throw error
+
+    await auditLogger.log({
+      userId: null,
+      action: "forgot_password",
+      resource: "/auth/forgot-password",
+      ipAddress: req.ip,
+      userAgent: req.get("User-Agent"),
+      success: true,
+      details: { email },
+    })
+
+    res.json({ success: true })
+  } catch (error) {
+    console.error("Forgot password error:", error)
+    res.status(500).json({ error: "Failed to send reset email" })
+  }
+})
+
+// Reset password
+router.post("/reset-password", async (req, res) => {
+  try {
+    const { token, password } = req.body
+
+    const { error } = await supabase.auth.updateUser({
+      password,
+    })
+
+    if (error) throw error
+
+    await auditLogger.log({
+      userId: null,
+      action: "reset_password",
+      resource: "/auth/reset-password",
+      ipAddress: req.ip,
+      userAgent: req.get("User-Agent"),
+      success: true,
+    })
+
+    res.json({ success: true })
+  } catch (error) {
+    console.error("Reset password error:", error)
+    res.status(400).json({ error: "Failed to reset password" })
+  }
+})
+
+// Check MFA status
+router.get("/mfa/status", authMiddleware, async (req, res) => {
+  try {
+    const { data: { factors }, error } = await supabase.auth.mfa.listFactors()
+    
+    if (error) throw error
+
+    res.json({
+      factors,
+      hasMFA: factors.some(factor => factor.status === 'verified')
+    })
+  } catch (error) {
+    console.error("MFA status check error:", error)
+    res.status(500).json({ error: "Failed to check MFA status" })
+  }
+})
+
+// Enroll in MFA
+router.post("/mfa/enroll", authMiddleware, async (req, res) => {
+  try {
+    const { data, error } = await supabase.auth.mfa.enroll({
+      factorType: 'totp'
+    })
+
+    if (error) throw error
+
+    await auditLogger.log({
+      userId: req.user.id,
+      action: "mfa_enroll",
+      resource: "/auth/mfa/enroll",
+      ipAddress: req.ip,
       userAgent: req.get("User-Agent"),
       success: true,
     })
 
     res.json({
       success: true,
-      accessToken: authData.properties?.access_token,
-      refreshToken: authData.properties?.refresh_token,
+      data
     })
   } catch (error) {
-    console.error("2FA verification error:", error)
-    res.status(500).json({ error: "Failed to verify 2FA code" })
+    console.error("MFA enrollment error:", error)
+    res.status(500).json({ error: "Failed to enroll in MFA" })
   }
 })
 
-// Setup 2FA for new users
-router.post("/setup-2fa", authMiddleware, async (req, res) => {
+// Verify MFA
+router.post("/mfa/verify", authMiddleware, async (req, res) => {
   try {
-    const { phone } = req.body
-    const userId = req.user.id
+    const { factorId, challengeId, code } = req.body
 
-    // Update user profile with 2FA settings
-    await supabase.from("user_profiles").upsert({
-      user_id: userId,
-      two_factor_enabled: true,
-      phone: phone,
-      updated_at: new Date().toISOString(),
+    const { data, error } = await supabase.auth.mfa.challenge({
+      factorId,
+      challengeId
     })
 
+    if (error) throw error
+
+    const { data: verifyData, error: verifyError } = await supabase.auth.mfa.verify({
+      factorId,
+      challengeId,
+      code
+    })
+
+    if (verifyError) throw verifyError
+
     await auditLogger.log({
-      userId,
-      action: "2fa_setup",
-      resource: "/auth/setup-2fa",
-      ipAddress: req.clientIP,
+      userId: req.user.id,
+      action: "mfa_verify",
+      resource: "/auth/mfa/verify",
+      ipAddress: req.ip,
       userAgent: req.get("User-Agent"),
       success: true,
     })
 
-    res.json({ success: true, message: "2FA enabled successfully" })
+    res.json({
+      success: true,
+      data: verifyData
+    })
   } catch (error) {
-    console.error("2FA setup error:", error)
-    res.status(500).json({ error: "Failed to setup 2FA" })
+    console.error("MFA verification error:", error)
+    res.status(500).json({ error: "Failed to verify MFA" })
   }
 })
 
-module.exports = router
+// Unenroll from MFA
+router.post("/mfa/unenroll", authMiddleware, async (req, res) => {
+  try {
+    const { factorId } = req.body
+
+    const { error } = await supabase.auth.mfa.unenroll({
+      factorId
+    })
+
+    if (error) throw error
+
+    await auditLogger.log({
+      userId: req.user.id,
+      action: "mfa_unenroll",
+      resource: "/auth/mfa/unenroll",
+      ipAddress: req.ip,
+      userAgent: req.get("User-Agent"),
+      success: true,
+    })
+
+    res.json({
+      success: true,
+      message: "MFA disabled successfully"
+    })
+  } catch (error) {
+    console.error("MFA unenrollment error:", error)
+    res.status(500).json({ error: "Failed to disable MFA" })
+  }
+})
+
+export default router

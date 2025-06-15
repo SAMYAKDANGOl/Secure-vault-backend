@@ -74,4 +74,39 @@ router.get("/", async (req, res) => {
   }
 })
 
+router.get("/activity/recent", async (req, res) => {
+  try {
+    const supabase = req.app.locals.supabase
+    const userId = req.user.id
+    console.log(`[${req.requestId}] Getting recent activity for user:`, userId)
+
+    // Get recent file-related activities from audit_logs
+    const { data: logs, error } = await supabase
+      .from("audit_logs")
+      .select("id, action, details, user_id, created_at")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(10)
+
+    if (error) {
+      console.error(`[${req.requestId}] Activity error:`, error)
+      throw error
+    }
+
+    // Transform logs for frontend
+    const activity = logs.map((log) => ({
+      id: log.id,
+      type: log.action,
+      fileName: log.details?.filename || "",
+      user: log.user_id,
+      timestamp: log.created_at,
+    }))
+
+    res.json(activity)
+  } catch (error) {
+    console.error(`[${req.requestId}] Activity error:`, error)
+    res.status(500).json({ error: "Failed to fetch recent activity" })
+  }
+})
+
 module.exports = router

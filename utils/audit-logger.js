@@ -1,6 +1,21 @@
-const { createClient } = require("@supabase/supabase-js")
+import { createClient } from '@supabase/supabase-js';
+import dotenv from 'dotenv';
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+// Configure environment variables
+dotenv.config();
+
+// Initialize Supabase client with environment variables
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!supabaseUrl || !supabaseKey) {
+  console.error('Missing required environment variables for audit logger:');
+  console.error('SUPABASE_URL:', supabaseUrl ? 'Present' : 'Missing');
+  console.error('SUPABASE_SERVICE_ROLE_KEY:', supabaseKey ? 'Present' : 'Missing');
+  throw new Error('Missing required environment variables for audit logger');
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 class AuditLogger {
   async log(entry) {
@@ -15,15 +30,15 @@ class AuditLogger {
         success: entry.success,
         details: entry.details,
         created_at: new Date().toISOString(),
-      }
+      };
 
-      const { error } = await supabase.from("audit_logs").insert(logEntry)
+      const { error } = await supabase.from("audit_logs").insert(logEntry);
 
       if (error) {
-        console.error("Audit log error:", error)
+        console.error("Audit log error:", error);
       }
     } catch (error) {
-      console.error("Audit logger error:", error)
+      console.error("Audit logger error:", error);
     }
   }
 
@@ -34,33 +49,33 @@ class AuditLogger {
         .select("*")
         .eq("user_id", userId)
         .order("created_at", { ascending: false })
-        .limit(limit)
+        .limit(limit);
 
-      if (error) throw error
-      return data || []
+      if (error) throw error;
+      return data || [];
     } catch (error) {
-      console.error("Failed to get recent activity:", error)
-      return []
+      console.error("Failed to get recent activity:", error);
+      return [];
     }
   }
 
   async getSecurityEvents(userId, timeframe = "24h") {
     try {
-      const now = new Date()
-      let startTime
+      const now = new Date();
+      let startTime;
 
       switch (timeframe) {
         case "1h":
-          startTime = new Date(now.getTime() - 60 * 60 * 1000)
-          break
+          startTime = new Date(now.getTime() - 60 * 60 * 1000);
+          break;
         case "24h":
-          startTime = new Date(now.getTime() - 24 * 60 * 60 * 1000)
-          break
+          startTime = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+          break;
         case "7d":
-          startTime = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
-          break
+          startTime = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+          break;
         default:
-          startTime = new Date(now.getTime() - 24 * 60 * 60 * 1000)
+          startTime = new Date(now.getTime() - 24 * 60 * 60 * 1000);
       }
 
       const { data, error } = await supabase
@@ -68,16 +83,16 @@ class AuditLogger {
         .select("*")
         .eq("user_id", userId)
         .gte("created_at", startTime.toISOString())
-        .in("action", ["login", "auth_failed", "2fa_failed", "password_change"])
-        .order("created_at", { ascending: false })
+        .in("action", ["login", "auth_failed", "mfa_failed", "password_change"])
+        .order("created_at", { ascending: false });
 
-      if (error) throw error
-      return data || []
+      if (error) throw error;
+      return data || [];
     } catch (error) {
-      console.error("Failed to get security events:", error)
-      return []
+      console.error("Failed to get security events:", error);
+      return [];
     }
   }
 }
 
-module.exports = new AuditLogger()
+export const auditLogger = new AuditLogger();
