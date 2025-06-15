@@ -7,6 +7,7 @@ const morgan = require("morgan")
 const path = require("path")
 const fs = require("fs").promises
 const { createClient } = require("@supabase/supabase-js")
+const multer = require('multer')
 require("dotenv").config()
 
 // Initialize Supabase client
@@ -226,5 +227,45 @@ app.listen(PORT, () => {
   console.log(`🔒 Security features: Encryption, 2FA, Access Control, Audit Logging, Supabase Storage`)
   console.log(`🔌 Connected to Supabase: ${process.env.SUPABASE_URL ? "Yes" : "No"}`)
 })
+
+// Ensure uploads directory exists
+const uploadsDir = path.join(__dirname, '../uploads')
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true })
+}
+
+// Configure multer for file storage
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, uploadsDir)
+  },
+  filename: function (req, file, cb) {
+    // Generate unique filename with timestamp
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9)
+    cb(null, uniqueSuffix + '-' + file.originalname)
+  }
+})
+
+// File filter to only allow encrypted files
+const fileFilter = (req, file, cb) => {
+  if (file.originalname.endsWith('.encrypted')) {
+    cb(null, true)
+  } else {
+    cb(new Error('Only encrypted files are allowed'), false)
+  }
+}
+
+const upload = multer({
+  storage: storage,
+  fileFilter: fileFilter,
+  limits: {
+    fileSize: 50 * 1024 * 1024 // 50MB limit
+  }
+})
+
+// POST endpoint for file upload
+const uploadRouter = require('./routes/upload')
+app.use('/api/upload', uploadRouter)
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')))
 
 module.exports = app
