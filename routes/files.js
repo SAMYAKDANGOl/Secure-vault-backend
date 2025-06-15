@@ -3,6 +3,12 @@ const multer = require("multer")
 const path = require("path")
 const fs = require("fs").promises
 const crypto = require("crypto")
+const { 
+  encryptFileBuffer, 
+  decryptFileBuffer, 
+  generateFileHash, 
+  generateSecureToken 
+} = require("../utils/crypto")
 
 const router = express.Router()
 
@@ -32,7 +38,7 @@ const fileValidator = {
   calculateHash: async (filePath) => {
     try {
       const fileBuffer = await fs.readFile(filePath)
-      return crypto.createHash("sha256").update(fileBuffer).digest("hex")
+      return generateFileHash(fileBuffer)
     } catch (error) {
       console.error("Hash calculation error:", error)
       throw error
@@ -134,7 +140,7 @@ router.get("/", async (req, res) => {
   }
 })
 
-// Upload file
+// Upload file with encryption
 router.post(
   "/upload",
   (req, res, next) => {
@@ -162,22 +168,42 @@ router.post(
       const supabase = req.app.locals.supabase
       const userId = req.user.id
       const uploadOptions = JSON.parse(req.body.options || "{}")
+      const encryptionPassword = req.body.encryptionPassword || req.user.email // Use email as default password
 
       console.log(`[${req.requestId}] Upload options:`, uploadOptions)
 
-      // Validate file integrity
+      // Read the uploaded file
+      const fileBuffer = await fs.readFile(req.file.path)
+      
+      // Calculate file hash
       console.log(`[${req.requestId}] Calculating file hash...`)
-      const fileHash = await fileValidator.calculateHash(req.file.path)
+      const fileHash = generateFileHash(fileBuffer)
       console.log(`[${req.requestId}] File hash:`, fileHash)
 
-      // Upload file to Supabase Storage
-      const fileBuffer = await fs.readFile(req.file.path)
+      let encryptedBuffer = fileBuffer
+      let encryptionMetadata = null
+
+      // Encrypt file if encryption is enabled
+      if (uploadOptions.encryption !== false) {
+        console.log(`[${req.requestId}] Encrypting file...`)
+        const encryptionResult = await encryptFileBuffer(fileBuffer, encryptionPassword)
+        encryptedBuffer = encryptionResult.encryptedData
+        encryptionMetadata = {
+          salt: encryptionResult.salt,
+          iv: encryptionResult.iv,
+          tag: encryptionResult.tag,
+          algorithm: "aes-256-gcm"
+        }
+        console.log(`[${req.requestId}] File encrypted successfully`)
+      }
+
+      // Upload encrypted file to Supabase Storage
       const fileExt = path.extname(req.file.originalname)
-      const fileName = `${userId}/${crypto.randomUUID()}${fileExt}`
+      const fileName = `${userId}/${generateSecureToken()}${fileExt}`
 
       const { data: storageData, error: storageError } = await supabase.storage
         .from("secure-files")
-        .upload(fileName, fileBuffer, {
+        .upload(fileName, encryptedBuffer, {
           contentType: req.file.mimetype,
           cacheControl: "3600",
         })
@@ -198,8 +224,8 @@ router.post(
           stored_name: fileName,
           size: req.file.size,
           mime_type: req.file.mimetype,
-          encrypted: uploadOptions.encryption || false,
-          encryption_key: uploadOptions.encryption ? crypto.randomBytes(32).toString("hex") : null,
+          encrypted: uploadOptions.encryption !== false,
+          encryption_metadata: encryptionMetadata,
           file_hash: fileHash,
           shared: false,
           access_control: uploadOptions.accessControl || null,
@@ -218,6 +244,7 @@ router.post(
         id: fileRecord.id,
         name: fileRecord.original_name,
         size: fileRecord.size,
+        encrypted: fileRecord.encrypted,
       })
 
       // Log audit
@@ -231,7 +258,8 @@ router.post(
         details: {
           filename: req.file.originalname,
           size: req.file.size,
-          encrypted: uploadOptions.encryption || false,
+          encrypted: fileRecord.encrypted,
+          encryptionAlgorithm: encryptionMetadata?.algorithm || "none",
         },
         created_at: new Date().toISOString(),
       })
@@ -249,6 +277,7 @@ router.post(
           name: fileRecord.original_name,
           size: fileRecord.size,
           type: fileRecord.mime_type,
+          encrypted: fileRecord.encrypted,
         },
       })
     } catch (error) {
@@ -273,12 +302,13 @@ router.post(
   },
 )
 
-// Download endpoint
+// Download endpoint with decryption
 router.get("/:id/download", async (req, res) => {
   try {
     const supabase = req.app.locals.supabase
     const userId = req.user.id
     const fileId = req.params.id
+    const decryptionPassword = req.query.password || req.user.email // Use email as default password
 
     console.log(`[${req.requestId}] Download request for file:`, fileId)
 
@@ -298,14 +328,32 @@ router.get("/:id/download", async (req, res) => {
 
     console.log(`[${req.requestId}] Found file:`, file.original_name)
 
-    // Download file from storage
-    const { data: fileData, error: storageError } = await supabase.storage
+    // Download encrypted file from storage
+    const { data: encryptedData, error: storageError } = await supabase.storage
       .from("secure-files")
       .download(file.stored_name)
 
     if (storageError) {
       console.error(`[${req.requestId}] Storage error:`, storageError)
       throw storageError
+    }
+
+    let decryptedBuffer = encryptedData
+
+    // Decrypt file if it's encrypted
+    if (file.encrypted) {
+      console.log(`[${req.requestId}] Decrypting file...`)
+      try {
+        const encryptedBuffer = Buffer.from(await encryptedData.arrayBuffer())
+        decryptedBuffer = await decryptFileBuffer(encryptedBuffer, decryptionPassword)
+        console.log(`[${req.requestId}] File decrypted successfully`)
+      } catch (decryptError) {
+        console.error(`[${req.requestId}] Decryption error:`, decryptError)
+        return res.status(400).json({ 
+          error: "Failed to decrypt file. Please check your password.",
+          details: "The file is encrypted and the provided password is incorrect."
+        })
+      }
     }
 
     // Update download count and last accessed
@@ -326,7 +374,11 @@ router.get("/:id/download", async (req, res) => {
       ip_address: req.clientIP,
       user_agent: req.get("User-Agent"),
       success: true,
-      details: { filename: file.original_name },
+      details: { 
+        filename: file.original_name,
+        encrypted: file.encrypted,
+        decryptionSuccess: true
+      },
       created_at: new Date().toISOString(),
     })
 
@@ -334,9 +386,8 @@ router.get("/:id/download", async (req, res) => {
     res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(file.original_name)}"`)
     res.setHeader("Content-Type", file.mime_type)
 
-    // Send file
-    const buffer = await fileData.arrayBuffer()
-    res.send(Buffer.from(buffer))
+    // Send decrypted file
+    res.send(decryptedBuffer)
 
     console.log(`[${req.requestId}] Download successful:`, file.original_name)
   } catch (error) {
@@ -471,12 +522,13 @@ router.post("/:id/share", async (req, res) => {
   }
 })
 
-// Preview endpoint
+// Preview endpoint with decryption support
 router.get("/:id/preview", async (req, res) => {
   try {
     const supabase = req.app.locals.supabase
     const userId = req.user.id
     const fileId = req.params.id
+    const decryptionPassword = req.query.password || req.user.email
 
     console.log(`[${req.requestId}] Preview request for file:`, fileId)
 
@@ -501,7 +553,75 @@ router.get("/:id/preview", async (req, res) => {
       return res.status(400).json({ error: "File type not supported for preview" })
     }
 
-    // Download file from storage
+    // Download encrypted file from storage
+    const { data: encryptedData, error: storageError } = await supabase.storage
+      .from("secure-files")
+      .download(file.stored_name)
+
+    if (storageError) {
+      console.error(`[${req.requestId}] Storage error:`, storageError)
+      throw storageError
+    }
+
+    let decryptedBuffer = encryptedData
+
+    // Decrypt file if it's encrypted
+    if (file.encrypted) {
+      console.log(`[${req.requestId}] Decrypting file for preview...`)
+      try {
+        const encryptedBuffer = Buffer.from(await encryptedData.arrayBuffer())
+        decryptedBuffer = await decryptFileBuffer(encryptedBuffer, decryptionPassword)
+        console.log(`[${req.requestId}] File decrypted for preview`)
+      } catch (decryptError) {
+        console.error(`[${req.requestId}] Preview decryption error:`, decryptError)
+        return res.status(400).json({ 
+          error: "Failed to decrypt file for preview. Please check your password.",
+          details: "The file is encrypted and the provided password is incorrect."
+        })
+      }
+    }
+
+    // Set response headers
+    res.setHeader("Content-Type", file.mime_type)
+
+    // Send decrypted file for preview
+    res.send(decryptedBuffer)
+
+    console.log(`[${req.requestId}] Preview successful:`, file.original_name)
+  } catch (error) {
+    console.error(`[${req.requestId}] Preview error:`, error)
+    res.status(500).json({ error: "Preview failed" })
+  }
+})
+
+// Encrypt existing file
+router.post("/:id/encrypt", async (req, res) => {
+  try {
+    const supabase = req.app.locals.supabase
+    const userId = req.user.id
+    const fileId = req.params.id
+    const encryptionPassword = req.body.password || req.user.email
+
+    console.log(`[${req.requestId}] Encrypt request for file:`, fileId)
+
+    // Get file metadata
+    const { data: file, error: dbError } = await supabase
+      .from("files")
+      .select("*")
+      .eq("id", fileId)
+      .eq("user_id", userId)
+      .eq("deleted", false)
+      .single()
+
+    if (dbError || !file) {
+      return res.status(404).json({ error: "File not found" })
+    }
+
+    if (file.encrypted) {
+      return res.status(400).json({ error: "File is already encrypted" })
+    }
+
+    // Download unencrypted file from storage
     const { data: fileData, error: storageError } = await supabase.storage
       .from("secure-files")
       .download(file.stored_name)
@@ -511,17 +631,213 @@ router.get("/:id/preview", async (req, res) => {
       throw storageError
     }
 
-    // Set response headers
-    res.setHeader("Content-Type", file.mime_type)
+    // Encrypt the file
+    console.log(`[${req.requestId}] Encrypting file...`)
+    const fileBuffer = Buffer.from(await fileData.arrayBuffer())
+    const encryptionResult = await encryptFileBuffer(fileBuffer, encryptionPassword)
+    
+    const encryptionMetadata = {
+      salt: encryptionResult.salt,
+      iv: encryptionResult.iv,
+      tag: encryptionResult.tag,
+      algorithm: "aes-256-gcm"
+    }
 
-    // Send file for preview
-    const buffer = await fileData.arrayBuffer()
-    res.send(Buffer.from(buffer))
+    // Upload encrypted file back to storage
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from("secure-files")
+      .upload(file.stored_name, encryptionResult.encryptedData, {
+        contentType: file.mime_type,
+        cacheControl: "3600",
+        upsert: true
+      })
 
-    console.log(`[${req.requestId}] Preview successful:`, file.original_name)
+    if (uploadError) {
+      console.error(`[${req.requestId}] Upload error:`, uploadError)
+      throw uploadError
+    }
+
+    // Update file record
+    await supabase
+      .from("files")
+      .update({
+        encrypted: true,
+        encryption_metadata: encryptionMetadata,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", fileId)
+
+    // Log audit
+    await supabase.from("audit_logs").insert({
+      user_id: userId,
+      action: "file_encrypt",
+      resource: `/files/${fileId}`,
+      ip_address: req.clientIP,
+      user_agent: req.get("User-Agent"),
+      success: true,
+      details: {
+        filename: file.original_name,
+        encryptionAlgorithm: "aes-256-gcm"
+      },
+      created_at: new Date().toISOString(),
+    })
+
+    console.log(`[${req.requestId}] File encrypted successfully:`, file.original_name)
+    res.json({ 
+      success: true, 
+      message: "File encrypted successfully",
+      file: {
+        id: file.id,
+        name: file.original_name,
+        encrypted: true
+      }
+    })
   } catch (error) {
-    console.error(`[${req.requestId}] Preview error:`, error)
-    res.status(500).json({ error: "Preview failed" })
+    console.error(`[${req.requestId}] Encryption error:`, error)
+    res.status(500).json({ error: "Encryption failed" })
+  }
+})
+
+// Decrypt existing file
+router.post("/:id/decrypt", async (req, res) => {
+  try {
+    const supabase = req.app.locals.supabase
+    const userId = req.user.id
+    const fileId = req.params.id
+    const decryptionPassword = req.body.password || req.user.email
+
+    console.log(`[${req.requestId}] Decrypt request for file:`, fileId)
+
+    // Get file metadata
+    const { data: file, error: dbError } = await supabase
+      .from("files")
+      .select("*")
+      .eq("id", fileId)
+      .eq("user_id", userId)
+      .eq("deleted", false)
+      .single()
+
+    if (dbError || !file) {
+      return res.status(404).json({ error: "File not found" })
+    }
+
+    if (!file.encrypted) {
+      return res.status(400).json({ error: "File is not encrypted" })
+    }
+
+    // Download encrypted file from storage
+    const { data: encryptedData, error: storageError } = await supabase.storage
+      .from("secure-files")
+      .download(file.stored_name)
+
+    if (storageError) {
+      console.error(`[${req.requestId}] Storage error:`, storageError)
+      throw storageError
+    }
+
+    // Decrypt the file
+    console.log(`[${req.requestId}] Decrypting file...`)
+    try {
+      const encryptedBuffer = Buffer.from(await encryptedData.arrayBuffer())
+      const decryptedBuffer = await decryptFileBuffer(encryptedBuffer, decryptionPassword)
+
+      // Upload decrypted file back to storage
+      const { data: uploadData, error: uploadError } = await supabase.storage
+        .from("secure-files")
+        .upload(file.stored_name, decryptedBuffer, {
+          contentType: file.mime_type,
+          cacheControl: "3600",
+          upsert: true
+        })
+
+      if (uploadError) {
+        console.error(`[${req.requestId}] Upload error:`, uploadError)
+        throw uploadError
+      }
+
+      // Update file record
+      await supabase
+        .from("files")
+        .update({
+          encrypted: false,
+          encryption_metadata: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", fileId)
+
+      // Log audit
+      await supabase.from("audit_logs").insert({
+        user_id: userId,
+        action: "file_decrypt",
+        resource: `/files/${fileId}`,
+        ip_address: req.clientIP,
+        user_agent: req.get("User-Agent"),
+        success: true,
+        details: {
+          filename: file.original_name
+        },
+        created_at: new Date().toISOString(),
+      })
+
+      console.log(`[${req.requestId}] File decrypted successfully:`, file.original_name)
+      res.json({ 
+        success: true, 
+        message: "File decrypted successfully",
+        file: {
+          id: file.id,
+          name: file.original_name,
+          encrypted: false
+        }
+      })
+    } catch (decryptError) {
+      console.error(`[${req.requestId}] Decryption error:`, decryptError)
+      return res.status(400).json({ 
+        error: "Failed to decrypt file. Please check your password.",
+        details: "The provided password is incorrect."
+      })
+    }
+  } catch (error) {
+    console.error(`[${req.requestId}] Decryption error:`, error)
+    res.status(500).json({ error: "Decryption failed" })
+  }
+})
+
+// Get file encryption status
+router.get("/:id/encryption-status", async (req, res) => {
+  try {
+    const supabase = req.app.locals.supabase
+    const userId = req.user.id
+    const fileId = req.params.id
+
+    console.log(`[${req.requestId}] Encryption status request for file:`, fileId)
+
+    // Get file metadata
+    const { data: file, error: dbError } = await supabase
+      .from("files")
+      .select("id, original_name, encrypted, encryption_metadata, created_at, updated_at")
+      .eq("id", fileId)
+      .eq("user_id", userId)
+      .eq("deleted", false)
+      .single()
+
+    if (dbError || !file) {
+      return res.status(404).json({ error: "File not found" })
+    }
+
+    res.json({
+      success: true,
+      file: {
+        id: file.id,
+        name: file.original_name,
+        encrypted: file.encrypted,
+        encryptionMetadata: file.encryption_metadata,
+        createdAt: file.created_at,
+        updatedAt: file.updated_at
+      }
+    })
+  } catch (error) {
+    console.error(`[${req.requestId}] Encryption status error:`, error)
+    res.status(500).json({ error: "Failed to get encryption status" })
   }
 })
 
