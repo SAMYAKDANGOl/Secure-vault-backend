@@ -8,6 +8,7 @@ const authMiddleware = require("../middleware/auth")
 const speakeasy = require('speakeasy')
 const QRCode = require('qrcode')
 const { generateBackupCodes } = require('../utils/mfa')
+const nodemailer = require('nodemailer')
 
 const router = express.Router()
 
@@ -22,6 +23,10 @@ router.post("/check-2fa", async (req, res) => {
   try {
     const { userId } = req.body
 
+    if (!userId) {
+      return res.status(400).json({ error: "User ID is required" })
+    }
+
     const { data: profile } = await supabase
       .from("user_profiles")
       .select("two_factor_enabled, phone")
@@ -29,37 +34,9 @@ router.post("/check-2fa", async (req, res) => {
       .single()
 
     if (profile?.two_factor_enabled) {
-      // Generate temporary token
-      const tempToken = crypto.randomBytes(32).toString("hex")
-
-      // Store temp token with expiration
-      await supabase.from("temp_tokens").insert({
-        user_id: userId,
-        token: tempToken,
-        expires_at: new Date(Date.now() + 5 * 60 * 1000), // 5 minutes
-      })
-
-      // Send SMS code
-      const code = Math.floor(100000 + Math.random() * 900000).toString()
-
-      await supabase.from("verification_codes").insert({
-        user_id: userId,
-        code: await bcrypt.hash(code, 10),
-        expires_at: new Date(Date.now() + 5 * 60 * 1000),
-      })
-
-      if (twilioClient && profile.phone) {
-        await twilioClient.messages.create({
-          body: `Your Secure Vault verification code is: ${code}`,
-          from: process.env.TWILIO_PHONE_NUMBER,
-          to: profile.phone,
-        })
-      }
-
       res.json({
         requiresTwoFactor: true,
-        tempToken,
-        message: "Verification code sent to your phone",
+        message: "Two-factor authentication required",
       })
     } else {
       res.json({ requiresTwoFactor: false })
@@ -180,78 +157,339 @@ router.post("/setup-2fa", authMiddleware, async (req, res) => {
   }
 })
 
-// Microsoft Authenticator (TOTP) MFA setup
-router.post('/mfa/setup', async (req, res) => {
+// Setup Microsoft Authenticator MFA
+router.post("/mfa/setup", authMiddleware, async (req, res) => {
   try {
-    const supabase = req.app.locals.supabase
-    const userId = req.user.id
-    const userEmail = req.user.email
+    const userId = req.user?.id || req.body.userId
 
-    // Generate TOTP secret
-    const secret = speakeasy.generateSecret({ name: `Secure Vault Pro (${userEmail})` })
-    const otpauthUrl = secret.otpauth_url
-    const qrCodeUrl = await QRCode.toDataURL(otpauthUrl)
-    const backupCodes = generateBackupCodes(10)
+    if (!userId) {
+      return res.status(400).json({ error: "User ID is required" })
+    }
 
-    // Store secret and backup codes in DB (not enabled yet)
-    await supabase.from('user_profiles').upsert({
+    // Get user email
+    const { data: userData, error: userError } = await supabase
+      .from("user_profiles")
+      .select("email")
+      .eq("user_id", userId)
+      .single()
+
+    if (userError) {
+      console.error("Error fetching user data:", userError)
+      return res.status(500).json({ error: "Failed to fetch user data" })
+    }
+
+    const userEmail = userData?.email || "user"
+
+    // Generate secret for TOTP
+    const secret = speakeasy.generateSecret({
+      name: `Secure Vault Pro (${userEmail})`,
+      issuer: "Secure Vault Pro",
+      length: 32,
+    })
+
+    // Store secret in database (not enabled yet)
+    const { error } = await supabase.from("user_mfa").upsert({
       user_id: userId,
-      mfa_secret: secret.base32,
-      mfa_backup_codes: backupCodes,
-      mfa_enabled: false,
-      updated_at: new Date().toISOString()
+      secret: secret.base32,
+      is_enabled: false,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+
+    if (error) throw error
+
+    await auditLogger.log({
+      userId,
+      action: "mfa_setup_start",
+      resource: "/auth/mfa/setup",
+      ipAddress: req.clientIP || req.ip,
+      userAgent: req.get("User-Agent"),
+      success: true,
     })
 
     res.json({
+      success: true,
       secret: secret.base32,
-      qrCodeUrl,
-      backupCodes
+      qrCode: secret.otpauth_url,
     })
   } catch (error) {
-    console.error('MFA setup error:', error)
-    res.status(500).json({ error: 'Failed to setup MFA' })
+    console.error("MFA setup error:", error)
+    res.status(500).json({ error: "Failed to setup MFA" })
   }
 })
 
-// Microsoft Authenticator (TOTP) MFA verify
-router.post('/mfa/verify', async (req, res) => {
+// Verify MFA setup
+router.post("/mfa/verify", authMiddleware, async (req, res) => {
   try {
-    const supabase = req.app.locals.supabase
-    const userId = req.user.id
-    const { code, secret } = req.body
+    const userId = req.user?.id || req.body.userId
 
-    // Get secret from DB if not provided
-    let mfaSecret = secret
-    if (!mfaSecret) {
-      const { data: profile } = await supabase
-        .from('user_profiles')
-        .select('mfa_secret')
-        .eq('user_id', userId)
-        .single()
-      mfaSecret = profile?.mfa_secret
+    if (!userId) {
+      return res.status(400).json({ error: "User ID is required" })
     }
 
+    const { token } = req.body
+
+    // Get user's MFA secret
+    const { data: mfaData, error } = await supabase
+      .from("user_mfa")
+      .select("secret")
+      .eq("user_id", userId)
+      .eq("is_enabled", false)
+      .single()
+
+    if (error || !mfaData) {
+      return res.status(400).json({ error: "MFA not setup for this user" })
+    }
+
+    // Verify TOTP token
     const verified = speakeasy.totp.verify({
-      secret: mfaSecret,
-      encoding: 'base32',
-      token: code,
-      window: 2
+      secret: mfaData.secret,
+      encoding: "base32",
+      token: token,
+      window: 2,
     })
 
     if (!verified) {
-      return res.status(400).json({ error: 'Invalid verification code' })
+      await auditLogger.log({
+        userId,
+        action: "mfa_verify_failed",
+        resource: "/auth/mfa/verify",
+        ipAddress: req.clientIP || req.ip,
+        userAgent: req.get("User-Agent"),
+        success: false,
+      })
+
+      return res.status(400).json({ error: "Invalid verification code" })
     }
 
-    await supabase.from('user_profiles').update({
-      mfa_enabled: true,
-      mfa_enabled_at: new Date().toISOString()
-    }).eq('user_id', userId)
+    // Enable MFA for the user
+    await supabase
+      .from("user_mfa")
+      .update({
+        is_enabled: true,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("user_id", userId)
 
-    res.json({ success: true })
+    // Update user profile
+    await supabase
+      .from("user_profiles")
+      .update({
+        two_factor_enabled: true,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("user_id", userId)
+
+    await auditLogger.log({
+      userId,
+      action: "mfa_enabled",
+      resource: "/auth/mfa/verify",
+      ipAddress: req.clientIP || req.ip,
+      userAgent: req.get("User-Agent"),
+      success: true,
+    })
+
+    res.json({ success: true, message: "MFA enabled successfully" })
   } catch (error) {
-    console.error('MFA verification error:', error)
-    res.status(500).json({ error: 'Failed to verify MFA' })
+    console.error("MFA verification error:", error)
+    res.status(500).json({ error: "Failed to verify MFA" })
   }
 })
+
+// Verify MFA during login
+router.post("/mfa/login-verify", async (req, res) => {
+  try {
+    const { userId, code, token } = req.body
+
+    let decodedUserId = userId
+
+    // If token is provided, decode it to get userId
+    if (token && !userId) {
+      try {
+        const tokenData = JSON.parse(atob(token))
+        decodedUserId = tokenData.userId
+      } catch (e) {
+        return res.status(400).json({ error: "Invalid token" })
+      }
+    }
+
+    if (!decodedUserId) {
+      return res.status(400).json({ error: "User ID is required" })
+    }
+
+    // Get user's MFA secret
+    const { data: mfaData, error } = await supabase
+      .from("user_mfa")
+      .select("secret")
+      .eq("user_id", decodedUserId)
+      .eq("is_enabled", true)
+      .single()
+
+    if (error || !mfaData) {
+      return res.status(400).json({ error: "MFA not enabled for this user" })
+    }
+
+    // Verify TOTP token
+    const verified = speakeasy.totp.verify({
+      secret: mfaData.secret,
+      encoding: "base32",
+      token: code,
+      window: 2,
+    })
+
+    if (!verified) {
+      await auditLogger.log({
+        userId: decodedUserId,
+        action: "mfa_login_failed",
+        resource: "/auth/mfa/login-verify",
+        ipAddress: req.clientIP || req.ip,
+        userAgent: req.get("User-Agent"),
+        success: false,
+      })
+
+      return res.status(400).json({ error: "Invalid verification code" })
+    }
+
+    await auditLogger.log({
+      userId: decodedUserId,
+      action: "mfa_login_success",
+      resource: "/auth/mfa/login-verify",
+      ipAddress: req.clientIP || req.ip,
+      userAgent: req.get("User-Agent"),
+      success: true,
+    })
+
+    res.json({ success: true, message: "MFA verification successful" })
+  } catch (error) {
+    console.error("MFA login verification error:", error)
+    res.status(500).json({ error: "Failed to verify MFA" })
+  }
+})
+
+// Send Email OTP
+router.post('/mfa/email-send', async (req, res) => {
+  const { email } = req.body;
+  const { data: user, error: userError } = await supabase
+    .from('user_profiles')
+    .select('id, email')
+    .eq('email', email)
+    .single();
+  if (userError || !user) return res.status(404).json({ error: 'User not found' });
+
+  const code = Math.floor(100000 + Math.random() * 900000).toString();
+  const codeHash = crypto.createHash('sha256').update(code).digest('hex');
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+
+  // Store code in verification_codes table
+  await supabase.from('verification_codes').insert({
+    user_id: user.id,
+    code_hash: codeHash,
+    expires_at: expiresAt,
+    used: false,
+  });
+
+  // Send email (configure your transporter)
+  const transporter = nodemailer.createTransport({
+    // TODO: Replace with your SMTP config
+    host: 'smtp.example.com',
+    port: 587,
+    secure: false,
+    auth: {
+      user: 'your@email.com',
+      pass: 'yourpassword',
+    },
+  });
+  await transporter.sendMail({
+    from: 'no-reply@yourapp.com',
+    to: user.email,
+    subject: 'Your Secure Vault OTP Code',
+    text: `Your OTP code is: ${code}`,
+  });
+
+  res.json({ success: true });
+});
+
+// Verify Email OTP
+router.post('/mfa/email-verify', async (req, res) => {
+  const { userId, code } = req.body;
+  const codeHash = crypto.createHash('sha256').update(code).digest('hex');
+  const { data: record, error: codeError } = await supabase
+    .from('verification_codes')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('code_hash', codeHash)
+    .eq('used', false)
+    .gte('expires_at', new Date().toISOString())
+    .single();
+
+  if (codeError || !record) return res.status(400).json({ error: 'Invalid or expired code' });
+
+  // Mark as used
+  await supabase.from('verification_codes').update({ used: true }).eq('id', record.id);
+
+  res.json({ success: true });
+});
+
+// Enable Email OTP MFA
+router.post('/mfa/setup-email', async (req, res) => {
+  const { userId } = req.body;
+  const { error } = await supabase
+    .from('user_profiles')
+    .update({ mfa_method: 'email' })
+    .eq('id', userId);
+  if (error) return res.status(500).json({ error: 'Failed to enable email MFA' });
+  res.json({ success: true });
+});
+
+// Send SMS OTP
+router.post('/mfa/sms-send', async (req, res) => {
+  const { userId } = req.body;
+  const { data: user, error: userError } = await supabase
+    .from('user_profiles')
+    .select('phone')
+    .eq('id', userId)
+    .single();
+  if (userError || !user || !user.phone) return res.status(400).json({ error: 'No phone number on file' });
+
+  const code = Math.floor(100000 + Math.random() * 900000).toString();
+  const codeHash = crypto.createHash('sha256').update(code).digest('hex');
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+
+  await supabase.from('verification_codes').insert({
+    user_id: userId,
+    code_hash: codeHash,
+    expires_at: expiresAt,
+    used: false,
+  });
+
+  const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+  await client.messages.create({
+    body: `Your Secure Vault OTP code is: ${code}`,
+    from: process.env.TWILIO_PHONE_NUMBER,
+    to: user.phone,
+  });
+
+  res.json({ success: true });
+});
+
+// Verify SMS OTP
+router.post('/mfa/sms-verify', async (req, res) => {
+  const { userId, code } = req.body;
+  const codeHash = crypto.createHash('sha256').update(code).digest('hex');
+  const { data: record, error: codeError } = await supabase
+    .from('verification_codes')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('code_hash', codeHash)
+    .eq('used', false)
+    .gte('expires_at', new Date().toISOString())
+    .single();
+
+  if (codeError || !record) return res.status(400).json({ error: 'Invalid or expired code' });
+
+  await supabase.from('verification_codes').update({ used: true }).eq('id', record.id);
+
+  res.json({ success: true });
+});
 
 module.exports = router
