@@ -91,8 +91,7 @@ router.get("/", async (req, res) => {
     const supabase = req.app.locals.supabase
     const userId = req.user.id
     const searchQuery = req.query.search
-    const parentFolderId = req.query.parentFolderId || null
-    console.log(`[${req.requestId}] Getting files for user:`, userId, "search:", searchQuery, "parentFolderId:", parentFolderId)
+    console.log(`[${req.requestId}] Getting files for user:`, userId, "search:", searchQuery)
 
     // Build the query
     let query = supabase
@@ -100,14 +99,6 @@ router.get("/", async (req, res) => {
       .select("*")
       .eq("user_id", userId)
       .eq("deleted", false)
-
-    // Filter by parent folder if specified
-    if (parentFolderId) {
-      query = query.eq("parent_folder_id", parentFolderId)
-    } else {
-      // If no parent folder specified, get root level items (no parent)
-      query = query.is("parent_folder_id", null)
-    }
 
     // Apply search filter if provided
     if (searchQuery && searchQuery.trim()) {
@@ -180,9 +171,8 @@ router.get("/", async (req, res) => {
         query = query.order("created_at", { ascending: false })
       }
     } else {
-      // No search - default sorting: folders first, then files, then by name
-      query = query.order("is_folder", { ascending: false })
-        .order("original_name", { ascending: true })
+      // No search - default sorting by creation date
+      query = query.order("created_at", { ascending: false })
     }
 
     const { data: files, error } = await query
@@ -192,7 +182,7 @@ router.get("/", async (req, res) => {
       throw error
     }
 
-    console.log(`[${req.requestId}] Found ${files.length} items for user`)
+    console.log(`[${req.requestId}] Found ${files.length} files for user`)
 
     // Transform file data for frontend
     const transformedFiles = files.map((file) => ({
@@ -200,10 +190,6 @@ router.get("/", async (req, res) => {
       name: file.original_name,
       size: file.size,
       type: file.mime_type,
-      isFolder: file.is_folder || false,
-      parentFolderId: file.parent_folder_id,
-      folderPath: file.folder_path,
-      folderDepth: file.folder_depth,
       uploadedAt: file.created_at,
       encrypted: file.encrypted,
       shared: file.shared,
@@ -222,8 +208,7 @@ router.get("/", async (req, res) => {
       success: true,
       details: { 
         count: files.length,
-        searchQuery: searchQuery || null,
-        parentFolderId: parentFolderId || null
+        searchQuery: searchQuery || null
       },
       created_at: new Date().toISOString(),
     })
@@ -235,7 +220,7 @@ router.get("/", async (req, res) => {
   }
 })
 
-// Upload file
+// Upload file with encryption
 router.post(
   "/upload",
   (req, res, next) => {
@@ -264,76 +249,41 @@ router.post(
       const userId = req.user.id
       const uploadOptions = JSON.parse(req.body.options || "{}")
       const encryptionPassword = req.body.encryptionPassword || req.user.email // Use email as default password
-      const parentFolderId = req.body.parentFolderId || null
 
-      console.log(`[${req.requestId}] Upload options:`, uploadOptions, "parentFolderId:", parentFolderId)
+      console.log(`[${req.requestId}] Upload options:`, uploadOptions)
 
-      // Validate parent folder if specified
-      if (parentFolderId) {
-        const { data: parentFolder, error: parentError } = await supabase
-          .from("files")
-          .select("id, is_folder")
-          .eq("id", parentFolderId)
-          .eq("user_id", userId)
-          .eq("deleted", false)
-          .single()
-
-        if (parentError || !parentFolder) {
-          return res.status(404).json({ error: "Parent folder not found" })
-        }
-
-        if (!parentFolder.is_folder) {
-          return res.status(400).json({ error: "Parent must be a folder" })
-        }
-      }
-
-      // Check for name conflicts in the target folder
-      const { data: existingFile, error: existingError } = await supabase
-        .from("files")
-        .select("id")
-        .eq("user_id", userId)
-        .eq("original_name", req.file.originalname)
-        .eq("parent_folder_id", parentFolderId)
-        .eq("deleted", false)
-        .single()
-
-      if (existingFile) {
-        return res.status(409).json({ error: "A file with this name already exists in this location" })
-      }
-
-      // Validate file integrity
+      // Read the uploaded file
+      const fileBuffer = await fs.readFile(req.file.path)
+      
+      // Calculate file hash
       console.log(`[${req.requestId}] Calculating file hash...`)
-      const fileHash = await fileValidator.calculateHash(req.file.path)
+      const fileHash = generateFileHash(fileBuffer)
       console.log(`[${req.requestId}] File hash:`, fileHash)
 
-      // Handle encryption if enabled
+      let encryptedBuffer = fileBuffer
       let encryptionMetadata = null
-      let fileBuffer = await fs.readFile(req.file.path)
-      
+
+      // Encrypt file if encryption is enabled
       if (uploadOptions.encryption !== false) {
         console.log(`[${req.requestId}] Encrypting file...`)
-        const encryptionKey = generateSecureToken(32)
-        const encryptedBuffer = await encryptFileBuffer(fileBuffer, encryptionKey)
-        fileBuffer = encryptedBuffer
-        
+        const encryptionResult = await encryptFileBuffer(fileBuffer, encryptionPassword)
+        encryptedBuffer = encryptionResult.encryptedData
         encryptionMetadata = {
-          algorithm: "AES-256-GCM",
-          keyDerivation: "PBKDF2",
-          iterations: 100000,
-          salt: crypto.randomBytes(16).toString("hex"),
-          iv: crypto.randomBytes(16).toString("hex"),
-          tag: crypto.randomBytes(16).toString("hex"),
-          key: encryptionKey.toString("hex")
+          salt: encryptionResult.salt,
+          iv: encryptionResult.iv,
+          tag: encryptionResult.tag,
+          algorithm: "aes-256-gcm"
         }
+        console.log(`[${req.requestId}] File encrypted successfully`)
       }
 
-      // Upload file to Supabase Storage
+      // Upload encrypted file to Supabase Storage
       const fileExt = path.extname(req.file.originalname)
-      const fileName = `${userId}/${crypto.randomUUID()}${fileExt}`
+      const fileName = `${userId}/${generateSecureToken()}${fileExt}`
 
       const { data: storageData, error: storageError } = await supabase.storage
         .from("secure-files")
-        .upload(fileName, fileBuffer, {
+        .upload(fileName, encryptedBuffer, {
           contentType: req.file.mimetype,
           cacheControl: "3600",
         })
@@ -354,8 +304,6 @@ router.post(
           stored_name: fileName,
           size: req.file.size,
           mime_type: req.file.mimetype,
-          is_folder: false,
-          parent_folder_id: parentFolderId,
           encrypted: uploadOptions.encryption !== false,
           encryption_metadata: encryptionMetadata,
           file_hash: fileHash,
@@ -377,7 +325,6 @@ router.post(
         name: fileRecord.original_name,
         size: fileRecord.size,
         encrypted: fileRecord.encrypted,
-        parentFolderId: fileRecord.parent_folder_id,
       })
 
       // Log audit
@@ -393,7 +340,6 @@ router.post(
           size: req.file.size,
           encrypted: fileRecord.encrypted,
           encryptionAlgorithm: encryptionMetadata?.algorithm || "none",
-          parentFolderId: parentFolderId,
         },
         created_at: new Date().toISOString(),
       })
@@ -411,9 +357,6 @@ router.post(
           name: fileRecord.original_name,
           size: fileRecord.size,
           type: fileRecord.mime_type,
-          isFolder: false,
-          parentFolderId: fileRecord.parent_folder_id,
-          folderPath: fileRecord.folder_path,
           encrypted: fileRecord.encrypted,
         },
       })
@@ -439,12 +382,13 @@ router.post(
   },
 )
 
-// Download endpoint
+// Download endpoint with decryption
 router.get("/:id/download", async (req, res) => {
   try {
     const supabase = req.app.locals.supabase
     const userId = req.user.id
     const fileId = req.params.id
+    const decryptionPassword = req.query.password || req.user.email // Use email as default password
 
     console.log(`[${req.requestId}] Download request for file:`, fileId)
 
@@ -464,14 +408,32 @@ router.get("/:id/download", async (req, res) => {
 
     console.log(`[${req.requestId}] Found file:`, file.original_name)
 
-    // Download file from storage
-    const { data: fileData, error: storageError } = await supabase.storage
+    // Download encrypted file from storage
+    const { data: encryptedData, error: storageError } = await supabase.storage
       .from("secure-files")
       .download(file.stored_name)
 
     if (storageError) {
       console.error(`[${req.requestId}] Storage error:`, storageError)
       throw storageError
+    }
+
+    let decryptedBuffer = encryptedData
+
+    // Decrypt file if it's encrypted
+    if (file.encrypted) {
+      console.log(`[${req.requestId}] Decrypting file...`)
+      try {
+        const encryptedBuffer = Buffer.from(await encryptedData.arrayBuffer())
+        decryptedBuffer = await decryptFileBuffer(encryptedBuffer, decryptionPassword)
+        console.log(`[${req.requestId}] File decrypted successfully`)
+      } catch (decryptError) {
+        console.error(`[${req.requestId}] Decryption error:`, decryptError)
+        return res.status(400).json({ 
+          error: "Failed to decrypt file. Please check your password.",
+          details: "The file is encrypted and the provided password is incorrect."
+        })
+      }
     }
 
     // Update download count and last accessed
@@ -492,7 +454,11 @@ router.get("/:id/download", async (req, res) => {
       ip_address: req.clientIP,
       user_agent: req.get("User-Agent"),
       success: true,
-      details: { filename: file.original_name },
+      details: { 
+        filename: file.original_name,
+        encrypted: file.encrypted,
+        decryptionSuccess: true
+      },
       created_at: new Date().toISOString(),
     })
 
@@ -500,9 +466,8 @@ router.get("/:id/download", async (req, res) => {
     res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(file.original_name)}"`)
     res.setHeader("Content-Type", file.mime_type)
 
-    // Send file
-    const buffer = await fileData.arrayBuffer()
-    res.send(Buffer.from(buffer))
+    // Send decrypted file
+    res.send(decryptedBuffer)
 
     console.log(`[${req.requestId}] Download successful:`, file.original_name)
   } catch (error) {
@@ -637,12 +602,13 @@ router.post("/:id/share", async (req, res) => {
   }
 })
 
-// Preview endpoint
+// Preview endpoint with decryption support
 router.get("/:id/preview", async (req, res) => {
   try {
     const supabase = req.app.locals.supabase
     const userId = req.user.id
     const fileId = req.params.id
+    const decryptionPassword = req.query.password || req.user.email
 
     console.log(`[${req.requestId}] Preview request for file:`, fileId)
 
@@ -667,7 +633,75 @@ router.get("/:id/preview", async (req, res) => {
       return res.status(400).json({ error: "File type not supported for preview" })
     }
 
-    // Download file from storage
+    // Download encrypted file from storage
+    const { data: encryptedData, error: storageError } = await supabase.storage
+      .from("secure-files")
+      .download(file.stored_name)
+
+    if (storageError) {
+      console.error(`[${req.requestId}] Storage error:`, storageError)
+      throw storageError
+    }
+
+    let decryptedBuffer = encryptedData
+
+    // Decrypt file if it's encrypted
+    if (file.encrypted) {
+      console.log(`[${req.requestId}] Decrypting file for preview...`)
+      try {
+        const encryptedBuffer = Buffer.from(await encryptedData.arrayBuffer())
+        decryptedBuffer = await decryptFileBuffer(encryptedBuffer, decryptionPassword)
+        console.log(`[${req.requestId}] File decrypted for preview`)
+      } catch (decryptError) {
+        console.error(`[${req.requestId}] Preview decryption error:`, decryptError)
+        return res.status(400).json({ 
+          error: "Failed to decrypt file for preview. Please check your password.",
+          details: "The file is encrypted and the provided password is incorrect."
+        })
+      }
+    }
+
+    // Set response headers
+    res.setHeader("Content-Type", file.mime_type)
+
+    // Send decrypted file for preview
+    res.send(decryptedBuffer)
+
+    console.log(`[${req.requestId}] Preview successful:`, file.original_name)
+  } catch (error) {
+    console.error(`[${req.requestId}] Preview error:`, error)
+    res.status(500).json({ error: "Preview failed" })
+  }
+})
+
+// Encrypt existing file
+router.post("/:id/encrypt", async (req, res) => {
+  try {
+    const supabase = req.app.locals.supabase
+    const userId = req.user.id
+    const fileId = req.params.id
+    const encryptionPassword = req.body.password || req.user.email
+
+    console.log(`[${req.requestId}] Encrypt request for file:`, fileId)
+
+    // Get file metadata
+    const { data: file, error: dbError } = await supabase
+      .from("files")
+      .select("*")
+      .eq("id", fileId)
+      .eq("user_id", userId)
+      .eq("deleted", false)
+      .single()
+
+    if (dbError || !file) {
+      return res.status(404).json({ error: "File not found" })
+    }
+
+    if (file.encrypted) {
+      return res.status(400).json({ error: "File is already encrypted" })
+    }
+
+    // Download unencrypted file from storage
     const { data: fileData, error: storageError } = await supabase.storage
       .from("secure-files")
       .download(file.stored_name)
@@ -677,506 +711,213 @@ router.get("/:id/preview", async (req, res) => {
       throw storageError
     }
 
-    // Set response headers
-    res.setHeader("Content-Type", file.mime_type)
-
-    // Send file for preview
-    const buffer = await fileData.arrayBuffer()
-    res.send(Buffer.from(buffer))
-
-    console.log(`[${req.requestId}] Preview successful:`, file.original_name)
-  } catch (error) {
-    console.error(`[${req.requestId}] Preview error:`, error)
-    res.status(500).json({ error: "Preview failed" })
-  }
-})
-
-// ==================== FOLDER MANAGEMENT ENDPOINTS ====================
-
-// Create a new folder
-router.post("/folders", async (req, res) => {
-  try {
-    const supabase = req.app.locals.supabase
-    const userId = req.user.id
-    const { name, parentFolderId } = req.body
-
-    console.log(`[${req.requestId}] Create folder request:`, { name, parentFolderId })
-
-    // Validate folder name
-    if (!name || name.trim().length === 0) {
-      return res.status(400).json({ error: "Folder name is required" })
+    // Encrypt the file
+    console.log(`[${req.requestId}] Encrypting file...`)
+    const fileBuffer = Buffer.from(await fileData.arrayBuffer())
+    const encryptionResult = await encryptFileBuffer(fileBuffer, encryptionPassword)
+    
+    const encryptionMetadata = {
+      salt: encryptionResult.salt,
+      iv: encryptionResult.iv,
+      tag: encryptionResult.tag,
+      algorithm: "aes-256-gcm"
     }
 
-    // Check for invalid characters in folder name
-    const invalidChars = /[<>:"/\\|?*]/
-    if (invalidChars.test(name)) {
-      return res.status(400).json({ 
-        error: "Folder name contains invalid characters. Cannot use: < > : \" / \\ | ? *" 
+    // Upload encrypted file back to storage
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from("secure-files")
+      .upload(file.stored_name, encryptionResult.encryptedData, {
+        contentType: file.mime_type,
+        cacheControl: "3600",
+        upsert: true
       })
+
+    if (uploadError) {
+      console.error(`[${req.requestId}] Upload error:`, uploadError)
+      throw uploadError
     }
 
-    // Check if parent folder exists and belongs to user
-    if (parentFolderId) {
-      const { data: parentFolder, error: parentError } = await supabase
-        .from("files")
-        .select("id, is_folder")
-        .eq("id", parentFolderId)
-        .eq("user_id", userId)
-        .eq("deleted", false)
-        .single()
-
-      if (parentError || !parentFolder) {
-        return res.status(404).json({ error: "Parent folder not found" })
-      }
-
-      if (!parentFolder.is_folder) {
-        return res.status(400).json({ error: "Parent must be a folder" })
-      }
-    }
-
-    // Check if folder with same name already exists in the same location
-    const { data: existingFolder, error: existingError } = await supabase
+    // Update file record
+    await supabase
       .from("files")
-      .select("id")
-      .eq("user_id", userId)
-      .eq("original_name", name.trim())
-      .eq("is_folder", true)
-      .eq("parent_folder_id", parentFolderId)
-      .eq("deleted", false)
-      .single()
-
-    if (existingFolder) {
-      return res.status(409).json({ error: "A folder with this name already exists in this location" })
-    }
-
-    // Create folder record
-    const { data: folder, error: createError } = await supabase
-      .from("files")
-      .insert({
-        user_id: userId,
-        original_name: name.trim(),
-        stored_name: `folder_${generateSecureToken()}`, // Placeholder for folder
-        size: 0, // Folders have no size
-        mime_type: "application/x-directory",
-        is_folder: true,
-        parent_folder_id: parentFolderId,
-        encrypted: false, // Folders are not encrypted
-        shared: false,
-        created_at: new Date().toISOString(),
+      .update({
+        encrypted: true,
+        encryption_metadata: encryptionMetadata,
         updated_at: new Date().toISOString(),
       })
-      .select()
-      .single()
-
-    if (createError) {
-      console.error(`[${req.requestId}] Folder creation error:`, createError)
-      throw createError
-    }
+      .eq("id", fileId)
 
     // Log audit
     await supabase.from("audit_logs").insert({
       user_id: userId,
-      action: "folder_create",
-      resource: `/files/folders/${folder.id}`,
+      action: "file_encrypt",
+      resource: `/files/${fileId}`,
       ip_address: req.clientIP,
       user_agent: req.get("User-Agent"),
       success: true,
       details: {
-        folderName: folder.original_name,
-        parentFolderId: parentFolderId,
-        folderPath: folder.folder_path
+        filename: file.original_name,
+        encryptionAlgorithm: "aes-256-gcm"
       },
       created_at: new Date().toISOString(),
     })
 
-    console.log(`[${req.requestId}] Folder created successfully:`, folder.original_name)
-
-    res.json({
-      success: true,
-      folder: {
-        id: folder.id,
-        name: folder.original_name,
-        isFolder: true,
-        parentFolderId: folder.parent_folder_id,
-        folderPath: folder.folder_path,
-        folderDepth: folder.folder_depth,
-        createdAt: folder.created_at,
-        updatedAt: folder.updated_at
+    console.log(`[${req.requestId}] File encrypted successfully:`, file.original_name)
+    res.json({ 
+      success: true, 
+      message: "File encrypted successfully",
+      file: {
+        id: file.id,
+        name: file.original_name,
+        encrypted: true
       }
     })
   } catch (error) {
-    console.error(`[${req.requestId}] Folder creation error:`, error)
-    res.status(500).json({ error: "Failed to create folder" })
+    console.error(`[${req.requestId}] Encryption error:`, error)
+    res.status(500).json({ error: "Encryption failed" })
   }
 })
 
-// Get folder tree structure
-router.get("/folders/tree", async (req, res) => {
+// Decrypt existing file
+router.post("/:id/decrypt", async (req, res) => {
   try {
     const supabase = req.app.locals.supabase
     const userId = req.user.id
-    const { parentFolderId } = req.query
+    const fileId = req.params.id
+    const decryptionPassword = req.body.password || req.user.email
 
-    console.log(`[${req.requestId}] Get folder tree request:`, { parentFolderId })
+    console.log(`[${req.requestId}] Decrypt request for file:`, fileId)
 
-    // Use the database function to get folder tree
-    const { data: items, error } = await supabase
-      .rpc('get_folder_tree', {
-        user_uuid: userId,
-        parent_folder_uuid: parentFolderId || null
-      })
-
-    if (error) {
-      console.error(`[${req.requestId}] Folder tree error:`, error)
-      throw error
-    }
-
-    // Transform data for frontend
-    const transformedItems = items.map(item => ({
-      id: item.id,
-      name: item.name,
-      isFolder: item.is_folder,
-      parentFolderId: item.parent_folder_id,
-      folderPath: item.folder_path,
-      folderDepth: item.folder_depth,
-      size: item.size,
-      mimeType: item.mime_type,
-      createdAt: item.created_at,
-      updatedAt: item.updated_at
-    }))
-
-    // Log audit
-    await supabase.from("audit_logs").insert({
-      user_id: userId,
-      action: "folder_tree_view",
-      resource: "/files/folders/tree",
-      ip_address: req.clientIP,
-      user_agent: req.get("User-Agent"),
-      success: true,
-      details: {
-        parentFolderId: parentFolderId || null,
-        itemCount: transformedItems.length
-      },
-      created_at: new Date().toISOString(),
-    })
-
-    res.json({
-      success: true,
-      items: transformedItems
-    })
-  } catch (error) {
-    console.error(`[${req.requestId}] Folder tree error:`, error)
-    res.status(500).json({ error: "Failed to get folder tree" })
-  }
-})
-
-// Move file or folder to different location
-router.put("/:id/move", async (req, res) => {
-  try {
-    const supabase = req.app.locals.supabase
-    const userId = req.user.id
-    const itemId = req.params.id
-    const { targetFolderId } = req.body
-
-    console.log(`[${req.requestId}] Move item request:`, { itemId, targetFolderId })
-
-    // Get the item to move
-    const { data: item, error: itemError } = await supabase
+    // Get file metadata
+    const { data: file, error: dbError } = await supabase
       .from("files")
       .select("*")
-      .eq("id", itemId)
+      .eq("id", fileId)
       .eq("user_id", userId)
       .eq("deleted", false)
       .single()
 
-    if (itemError || !item) {
-      return res.status(404).json({ error: "Item not found" })
+    if (dbError || !file) {
+      return res.status(404).json({ error: "File not found" })
     }
 
-    // Validate target folder if provided
-    if (targetFolderId) {
-      const { data: targetFolder, error: targetError } = await supabase
+    if (!file.encrypted) {
+      return res.status(400).json({ error: "File is not encrypted" })
+    }
+
+    // Download encrypted file from storage
+    const { data: encryptedData, error: storageError } = await supabase.storage
+      .from("secure-files")
+      .download(file.stored_name)
+
+    if (storageError) {
+      console.error(`[${req.requestId}] Storage error:`, storageError)
+      throw storageError
+    }
+
+    // Decrypt the file
+    console.log(`[${req.requestId}] Decrypting file...`)
+    try {
+      const encryptedBuffer = Buffer.from(await encryptedData.arrayBuffer())
+      const decryptedBuffer = await decryptFileBuffer(encryptedBuffer, decryptionPassword)
+
+      // Upload decrypted file back to storage
+      const { data: uploadData, error: uploadError } = await supabase.storage
+        .from("secure-files")
+        .upload(file.stored_name, decryptedBuffer, {
+          contentType: file.mime_type,
+          cacheControl: "3600",
+          upsert: true
+        })
+
+      if (uploadError) {
+        console.error(`[${req.requestId}] Upload error:`, uploadError)
+        throw uploadError
+      }
+
+      // Update file record
+      await supabase
         .from("files")
-        .select("id, is_folder")
-        .eq("id", targetFolderId)
-        .eq("user_id", userId)
-        .eq("deleted", false)
-        .single()
+        .update({
+          encrypted: false,
+          encryption_metadata: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", fileId)
 
-      if (targetError || !targetFolder) {
-        return res.status(404).json({ error: "Target folder not found" })
-      }
+      // Log audit
+      await supabase.from("audit_logs").insert({
+        user_id: userId,
+        action: "file_decrypt",
+        resource: `/files/${fileId}`,
+        ip_address: req.clientIP,
+        user_agent: req.get("User-Agent"),
+        success: true,
+        details: {
+          filename: file.original_name
+        },
+        created_at: new Date().toISOString(),
+      })
 
-      if (!targetFolder.is_folder) {
-        return res.status(400).json({ error: "Target must be a folder" })
-      }
-
-      // Prevent moving a folder into itself or its descendants
-      if (item.is_folder) {
-        const { data: descendants } = await supabase
-          .from("files")
-          .select("id")
-          .eq("user_id", userId)
-          .like("folder_path", item.folder_path + "/%")
-          .eq("deleted", false)
-
-        if (descendants && descendants.some(desc => desc.id === targetFolderId)) {
-          return res.status(400).json({ error: "Cannot move folder into its own subfolder" })
+      console.log(`[${req.requestId}] File decrypted successfully:`, file.original_name)
+      res.json({ 
+        success: true, 
+        message: "File decrypted successfully",
+        file: {
+          id: file.id,
+          name: file.original_name,
+          encrypted: false
         }
-      }
-    }
-
-    // Check for name conflicts in target location
-    const { data: existingItem, error: existingError } = await supabase
-      .from("files")
-      .select("id")
-      .eq("user_id", userId)
-      .eq("original_name", item.original_name)
-      .eq("parent_folder_id", targetFolderId)
-      .eq("deleted", false)
-      .single()
-
-    if (existingItem) {
-      return res.status(409).json({ error: "An item with this name already exists in the target location" })
-    }
-
-    // Update the item's parent folder
-    const { error: updateError } = await supabase
-      .from("files")
-      .update({
-        parent_folder_id: targetFolderId,
-        updated_at: new Date().toISOString()
       })
-      .eq("id", itemId)
-
-    if (updateError) {
-      console.error(`[${req.requestId}] Move error:`, updateError)
-      throw updateError
-    }
-
-    // Get updated item
-    const { data: updatedItem, error: updatedError } = await supabase
-      .from("files")
-      .select("*")
-      .eq("id", itemId)
-      .single()
-
-    if (updatedError) {
-      throw updatedError
-    }
-
-    // Log audit
-    await supabase.from("audit_logs").insert({
-      user_id: userId,
-      action: "item_move",
-      resource: `/files/${itemId}/move`,
-      ip_address: req.clientIP,
-      user_agent: req.get("User-Agent"),
-      success: true,
-      details: {
-        itemName: item.original_name,
-        itemType: item.is_folder ? "folder" : "file",
-        oldParentId: item.parent_folder_id,
-        newParentId: targetFolderId,
-        newPath: updatedItem.folder_path
-      },
-      created_at: new Date().toISOString(),
-    })
-
-    console.log(`[${req.requestId}] Item moved successfully:`, item.original_name)
-
-    res.json({
-      success: true,
-      item: {
-        id: updatedItem.id,
-        name: updatedItem.original_name,
-        isFolder: updatedItem.is_folder,
-        parentFolderId: updatedItem.parent_folder_id,
-        folderPath: updatedItem.folder_path,
-        folderDepth: updatedItem.folder_depth,
-        updatedAt: updatedItem.updated_at
-      }
-    })
-  } catch (error) {
-    console.error(`[${req.requestId}] Move error:`, error)
-    res.status(500).json({ error: "Failed to move item" })
-  }
-})
-
-// Rename file or folder
-router.put("/:id/rename", async (req, res) => {
-  try {
-    const supabase = req.app.locals.supabase
-    const userId = req.user.id
-    const itemId = req.params.id
-    const { newName } = req.body
-
-    console.log(`[${req.requestId}] Rename item request:`, { itemId, newName })
-
-    // Validate new name
-    if (!newName || newName.trim().length === 0) {
-      return res.status(400).json({ error: "New name is required" })
-    }
-
-    // Check for invalid characters
-    const invalidChars = /[<>:"/\\|?*]/
-    if (invalidChars.test(newName)) {
+    } catch (decryptError) {
+      console.error(`[${req.requestId}] Decryption error:`, decryptError)
       return res.status(400).json({ 
-        error: "Name contains invalid characters. Cannot use: < > : \" / \\ | ? *" 
+        error: "Failed to decrypt file. Please check your password.",
+        details: "The provided password is incorrect."
       })
     }
-
-    // Get the item to rename
-    const { data: item, error: itemError } = await supabase
-      .from("files")
-      .select("*")
-      .eq("id", itemId)
-      .eq("user_id", userId)
-      .eq("deleted", false)
-      .single()
-
-    if (itemError || !item) {
-      return res.status(404).json({ error: "Item not found" })
-    }
-
-    // Check for name conflicts in same location
-    const { data: existingItem, error: existingError } = await supabase
-      .from("files")
-      .select("id")
-      .eq("user_id", userId)
-      .eq("original_name", newName.trim())
-      .eq("parent_folder_id", item.parent_folder_id)
-      .eq("deleted", false)
-      .single()
-
-    if (existingItem) {
-      return res.status(409).json({ error: "An item with this name already exists in this location" })
-    }
-
-    // Update the item's name
-    const { error: updateError } = await supabase
-      .from("files")
-      .update({
-        original_name: newName.trim(),
-        updated_at: new Date().toISOString()
-      })
-      .eq("id", itemId)
-
-    if (updateError) {
-      console.error(`[${req.requestId}] Rename error:`, updateError)
-      throw updateError
-    }
-
-    // Get updated item
-    const { data: updatedItem, error: updatedError } = await supabase
-      .from("files")
-      .select("*")
-      .eq("id", itemId)
-      .single()
-
-    if (updatedError) {
-      throw updatedError
-    }
-
-    // Log audit
-    await supabase.from("audit_logs").insert({
-      user_id: userId,
-      action: "item_rename",
-      resource: `/files/${itemId}/rename`,
-      ip_address: req.clientIP,
-      user_agent: req.get("User-Agent"),
-      success: true,
-      details: {
-        oldName: item.original_name,
-        newName: updatedItem.original_name,
-        itemType: item.is_folder ? "folder" : "file"
-      },
-      created_at: new Date().toISOString(),
-    })
-
-    console.log(`[${req.requestId}] Item renamed successfully:`, item.original_name, "→", updatedItem.original_name)
-
-    res.json({
-      success: true,
-      item: {
-        id: updatedItem.id,
-        name: updatedItem.original_name,
-        isFolder: updatedItem.is_folder,
-        parentFolderId: updatedItem.parent_folder_id,
-        folderPath: updatedItem.folder_path,
-        folderDepth: updatedItem.folder_depth,
-        updatedAt: updatedItem.updated_at
-      }
-    })
   } catch (error) {
-    console.error(`[${req.requestId}] Rename error:`, error)
-    res.status(500).json({ error: "Failed to rename item" })
+    console.error(`[${req.requestId}] Decryption error:`, error)
+    res.status(500).json({ error: "Decryption failed" })
   }
 })
 
-// Get folder breadcrumb navigation
-router.get("/folders/:id/breadcrumb", async (req, res) => {
+// Get file encryption status
+router.get("/:id/encryption-status", async (req, res) => {
   try {
     const supabase = req.app.locals.supabase
     const userId = req.user.id
-    const folderId = req.params.id
+    const fileId = req.params.id
 
-    console.log(`[${req.requestId}] Get breadcrumb request for folder:`, folderId)
+    console.log(`[${req.requestId}] Encryption status request for file:`, fileId)
 
-    // Get the folder and its path
-    const { data: folder, error: folderError } = await supabase
+    // Get file metadata
+    const { data: file, error: dbError } = await supabase
       .from("files")
-      .select("id, original_name, folder_path, parent_folder_id")
-      .eq("id", folderId)
+      .select("id, original_name, encrypted, encryption_metadata, created_at, updated_at")
+      .eq("id", fileId)
       .eq("user_id", userId)
-      .eq("is_folder", true)
       .eq("deleted", false)
       .single()
 
-    if (folderError || !folder) {
-      return res.status(404).json({ error: "Folder not found" })
-    }
-
-    // Build breadcrumb from folder path
-    const pathParts = folder.folder_path.split('/').filter(part => part.length > 0)
-    const breadcrumb = []
-
-    // Add root
-    breadcrumb.push({
-      id: null,
-      name: "Root",
-      path: "/"
-    })
-
-    // Build breadcrumb for each path level
-    let currentPath = ""
-    for (let i = 0; i < pathParts.length; i++) {
-      currentPath += "/" + pathParts[i]
-      
-      // Get folder ID for this path level
-      const { data: pathFolder } = await supabase
-        .from("files")
-        .select("id")
-        .eq("user_id", userId)
-        .eq("folder_path", currentPath)
-        .eq("is_folder", true)
-        .eq("deleted", false)
-        .single()
-
-      breadcrumb.push({
-        id: pathFolder?.id || null,
-        name: pathParts[i],
-        path: currentPath
-      })
+    if (dbError || !file) {
+      return res.status(404).json({ error: "File not found" })
     }
 
     res.json({
       success: true,
-      breadcrumb: breadcrumb
+      file: {
+        id: file.id,
+        name: file.original_name,
+        encrypted: file.encrypted,
+        encryptionMetadata: file.encryption_metadata,
+        createdAt: file.created_at,
+        updatedAt: file.updated_at
+      }
     })
   } catch (error) {
-    console.error(`[${req.requestId}] Breadcrumb error:`, error)
-    res.status(500).json({ error: "Failed to get breadcrumb" })
+    console.error(`[${req.requestId}] Encryption status error:`, error)
+    res.status(500).json({ error: "Failed to get encryption status" })
   }
 })
 
