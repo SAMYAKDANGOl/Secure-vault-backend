@@ -3,6 +3,12 @@ const multer = require("multer")
 const path = require("path")
 const fs = require("fs").promises
 const crypto = require("crypto")
+const { 
+  encryptFileBuffer, 
+  decryptFileBuffer, 
+  generateFileHash, 
+  generateSecureToken 
+} = require("../utils/crypto")
 
 const router = express.Router()
 
@@ -32,7 +38,7 @@ const fileValidator = {
   calculateHash: async (filePath) => {
     try {
       const fileBuffer = await fs.readFile(filePath)
-      return crypto.createHash("sha256").update(fileBuffer).digest("hex")
+      return generateFileHash(fileBuffer)
     } catch (error) {
       console.error("Hash calculation error:", error)
       throw error
@@ -84,23 +90,16 @@ router.get("/", async (req, res) => {
   try {
     const supabase = req.app.locals.supabase
     const userId = req.user.id
-<<<<<<< Updated upstream
-    console.log(`[${req.requestId}] Getting files for user:`, userId)
-=======
     const searchQuery = req.query.search
     const parentFolderId = req.query.parentFolderId || null
     console.log(`[${req.requestId}] Getting files for user:`, userId, "search:", searchQuery, "parentFolderId:", parentFolderId)
->>>>>>> Stashed changes
 
-    // Get files from Supabase
-    const { data: files, error } = await supabase
+    // Build the query
+    let query = supabase
       .from("files")
       .select("*")
       .eq("user_id", userId)
       .eq("deleted", false)
-<<<<<<< Updated upstream
-      .order("created_at", { ascending: false })
-=======
 
     // Filter by parent folder if specified
     if (parentFolderId) {
@@ -187,7 +186,6 @@ router.get("/", async (req, res) => {
     }
 
     const { data: files, error } = await query
->>>>>>> Stashed changes
 
     if (error) {
       console.error(`[${req.requestId}] Supabase error:`, error)
@@ -222,15 +220,11 @@ router.get("/", async (req, res) => {
       ip_address: req.clientIP,
       user_agent: req.get("User-Agent"),
       success: true,
-<<<<<<< Updated upstream
-      details: { count: files.length },
-=======
       details: { 
         count: files.length,
         searchQuery: searchQuery || null,
         parentFolderId: parentFolderId || null
       },
->>>>>>> Stashed changes
       created_at: new Date().toISOString(),
     })
 
@@ -269,11 +263,8 @@ router.post(
       const supabase = req.app.locals.supabase
       const userId = req.user.id
       const uploadOptions = JSON.parse(req.body.options || "{}")
-<<<<<<< Updated upstream
-=======
       const encryptionPassword = req.body.encryptionPassword || req.user.email // Use email as default password
       const parentFolderId = req.body.parentFolderId || null
->>>>>>> Stashed changes
 
       console.log(`[${req.requestId}] Upload options:`, uploadOptions, "parentFolderId:", parentFolderId)
 
@@ -315,8 +306,28 @@ router.post(
       const fileHash = await fileValidator.calculateHash(req.file.path)
       console.log(`[${req.requestId}] File hash:`, fileHash)
 
+      // Handle encryption if enabled
+      let encryptionMetadata = null
+      let fileBuffer = await fs.readFile(req.file.path)
+      
+      if (uploadOptions.encryption !== false) {
+        console.log(`[${req.requestId}] Encrypting file...`)
+        const encryptionKey = generateSecureToken(32)
+        const encryptedBuffer = await encryptFileBuffer(fileBuffer, encryptionKey)
+        fileBuffer = encryptedBuffer
+        
+        encryptionMetadata = {
+          algorithm: "AES-256-GCM",
+          keyDerivation: "PBKDF2",
+          iterations: 100000,
+          salt: crypto.randomBytes(16).toString("hex"),
+          iv: crypto.randomBytes(16).toString("hex"),
+          tag: crypto.randomBytes(16).toString("hex"),
+          key: encryptionKey.toString("hex")
+        }
+      }
+
       // Upload file to Supabase Storage
-      const fileBuffer = await fs.readFile(req.file.path)
       const fileExt = path.extname(req.file.originalname)
       const fileName = `${userId}/${crypto.randomUUID()}${fileExt}`
 
@@ -343,15 +354,10 @@ router.post(
           stored_name: fileName,
           size: req.file.size,
           mime_type: req.file.mimetype,
-<<<<<<< Updated upstream
-          encrypted: uploadOptions.encryption || false,
-          encryption_key: uploadOptions.encryption ? crypto.randomBytes(32).toString("hex") : null,
-=======
           is_folder: false,
           parent_folder_id: parentFolderId,
           encrypted: uploadOptions.encryption !== false,
           encryption_metadata: encryptionMetadata,
->>>>>>> Stashed changes
           file_hash: fileHash,
           shared: false,
           access_control: uploadOptions.accessControl || null,
@@ -370,11 +376,8 @@ router.post(
         id: fileRecord.id,
         name: fileRecord.original_name,
         size: fileRecord.size,
-<<<<<<< Updated upstream
-=======
         encrypted: fileRecord.encrypted,
         parentFolderId: fileRecord.parent_folder_id,
->>>>>>> Stashed changes
       })
 
       // Log audit
@@ -388,13 +391,9 @@ router.post(
         details: {
           filename: req.file.originalname,
           size: req.file.size,
-<<<<<<< Updated upstream
-          encrypted: uploadOptions.encryption || false,
-=======
           encrypted: fileRecord.encrypted,
           encryptionAlgorithm: encryptionMetadata?.algorithm || "none",
           parentFolderId: parentFolderId,
->>>>>>> Stashed changes
         },
         created_at: new Date().toISOString(),
       })
@@ -412,13 +411,10 @@ router.post(
           name: fileRecord.original_name,
           size: fileRecord.size,
           type: fileRecord.mime_type,
-<<<<<<< Updated upstream
-=======
           isFolder: false,
           parentFolderId: fileRecord.parent_folder_id,
           folderPath: fileRecord.folder_path,
           encrypted: fileRecord.encrypted,
->>>>>>> Stashed changes
         },
       })
     } catch (error) {
