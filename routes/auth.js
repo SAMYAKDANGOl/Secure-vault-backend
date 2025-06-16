@@ -5,6 +5,9 @@ const { createClient } = require("@supabase/supabase-js")
 const twilio = require("twilio")
 const auditLogger = require("../utils/audit-logger")
 const authMiddleware = require("../middleware/auth")
+const speakeasy = require('speakeasy')
+const QRCode = require('qrcode')
+const { generateBackupCodes } = require('../utils/mfa')
 
 const router = express.Router()
 
@@ -174,6 +177,80 @@ router.post("/setup-2fa", authMiddleware, async (req, res) => {
   } catch (error) {
     console.error("2FA setup error:", error)
     res.status(500).json({ error: "Failed to setup 2FA" })
+  }
+})
+
+// Microsoft Authenticator (TOTP) MFA setup
+router.post('/mfa/setup', async (req, res) => {
+  try {
+    const supabase = req.app.locals.supabase
+    const userId = req.user.id
+    const userEmail = req.user.email
+
+    // Generate TOTP secret
+    const secret = speakeasy.generateSecret({ name: `Secure Vault Pro (${userEmail})` })
+    const otpauthUrl = secret.otpauth_url
+    const qrCodeUrl = await QRCode.toDataURL(otpauthUrl)
+    const backupCodes = generateBackupCodes(10)
+
+    // Store secret and backup codes in DB (not enabled yet)
+    await supabase.from('user_profiles').upsert({
+      user_id: userId,
+      mfa_secret: secret.base32,
+      mfa_backup_codes: backupCodes,
+      mfa_enabled: false,
+      updated_at: new Date().toISOString()
+    })
+
+    res.json({
+      secret: secret.base32,
+      qrCodeUrl,
+      backupCodes
+    })
+  } catch (error) {
+    console.error('MFA setup error:', error)
+    res.status(500).json({ error: 'Failed to setup MFA' })
+  }
+})
+
+// Microsoft Authenticator (TOTP) MFA verify
+router.post('/mfa/verify', async (req, res) => {
+  try {
+    const supabase = req.app.locals.supabase
+    const userId = req.user.id
+    const { code, secret } = req.body
+
+    // Get secret from DB if not provided
+    let mfaSecret = secret
+    if (!mfaSecret) {
+      const { data: profile } = await supabase
+        .from('user_profiles')
+        .select('mfa_secret')
+        .eq('user_id', userId)
+        .single()
+      mfaSecret = profile?.mfa_secret
+    }
+
+    const verified = speakeasy.totp.verify({
+      secret: mfaSecret,
+      encoding: 'base32',
+      token: code,
+      window: 2
+    })
+
+    if (!verified) {
+      return res.status(400).json({ error: 'Invalid verification code' })
+    }
+
+    await supabase.from('user_profiles').update({
+      mfa_enabled: true,
+      mfa_enabled_at: new Date().toISOString()
+    }).eq('user_id', userId)
+
+    res.json({ success: true })
+  } catch (error) {
+    console.error('MFA verification error:', error)
+    res.status(500).json({ error: 'Failed to verify MFA' })
   }
 })
 

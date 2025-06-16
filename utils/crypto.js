@@ -26,8 +26,8 @@ async function encryptFileBuffer(fileBuffer, password, salt = null) {
     // Generate random IV
     const iv = crypto.randomBytes(IV_LENGTH)
     
-    // Create cipher
-    const cipher = crypto.createCipher(ALGORITHM, key)
+    // Create cipher using createCipheriv (newer API)
+    const cipher = crypto.createCipheriv(ALGORITHM, key, iv)
     cipher.setAAD(Buffer.from("secure-vault-file"))
     
     // Encrypt the file
@@ -69,8 +69,8 @@ async function decryptFileBuffer(encryptedBuffer, password) {
     // Derive decryption key from password and salt
     const key = crypto.pbkdf2Sync(password, salt, ITERATIONS, KEY_LENGTH, 'sha512')
     
-    // Create decipher
-    const decipher = crypto.createDecipher(ALGORITHM, key)
+    // Create decipher using createDecipheriv (newer API)
+    const decipher = crypto.createDecipheriv(ALGORITHM, key, iv)
     decipher.setAAD(Buffer.from("secure-vault-file"))
     decipher.setAuthTag(tag)
     

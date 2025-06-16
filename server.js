@@ -166,6 +166,7 @@ app.use("/api/stats", authMiddleware, require("./routes/stats"))
 app.use("/api/access-control", authMiddleware, require("./routes/access-control"))
 app.use("/api/audit", authMiddleware, require("./routes/audit"))
 app.use("/api/user", authMiddleware, require("./routes/user"))
+app.use("/api/mfa", authMiddleware, require("./routes/mfa"))
 
 // Enhanced error handling
 app.use((err, req, res, next) => {

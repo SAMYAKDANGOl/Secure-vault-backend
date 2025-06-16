@@ -90,15 +90,92 @@ router.get("/", async (req, res) => {
   try {
     const supabase = req.app.locals.supabase
     const userId = req.user.id
-    console.log(`[${req.requestId}] Getting files for user:`, userId)
+    const searchQuery = req.query.search
+    console.log(`[${req.requestId}] Getting files for user:`, userId, "search:", searchQuery)
 
-    // Get files from Supabase
-    const { data: files, error } = await supabase
+    // Build the query
+    let query = supabase
       .from("files")
       .select("*")
       .eq("user_id", userId)
       .eq("deleted", false)
-      .order("created_at", { ascending: false })
+
+    // Apply search filter if provided
+    if (searchQuery && searchQuery.trim()) {
+      console.log(`[${req.requestId}] Applying search filter:`, searchQuery)
+      
+      // Parse search query if it's JSON (from frontend filters)
+      let searchFilters = {}
+      try {
+        if (searchQuery.startsWith('{')) {
+          searchFilters = JSON.parse(searchQuery)
+        } else {
+          // Simple text search
+          searchFilters = { query: searchQuery }
+        }
+      } catch (e) {
+        // If JSON parsing fails, treat as simple text search
+        searchFilters = { query: searchQuery }
+      }
+
+      // Apply text search on file name
+      if (searchFilters.query) {
+        query = query.ilike("original_name", `%${searchFilters.query}%`)
+      }
+
+      // Apply file type filter
+      if (searchFilters.type && searchFilters.type !== "all") {
+        const mimeTypeMap = {
+          image: "image/",
+          document: ["application/pdf", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "text/"],
+          video: "video/",
+          audio: "audio/",
+          archive: ["application/zip", "application/x-rar-compressed", "application/x-7z-compressed"]
+        }
+
+        const typeFilter = mimeTypeMap[searchFilters.type]
+        if (typeFilter) {
+          if (Array.isArray(typeFilter)) {
+            // Multiple MIME types for this category
+            const orConditions = typeFilter.map(type => `mime_type.ilike.${type}%`).join(',')
+            query = query.or(orConditions)
+          } else {
+            // Single MIME type prefix
+            query = query.ilike("mime_type", `${typeFilter}%`)
+          }
+        }
+      }
+
+      // Apply sorting
+      if (searchFilters.sortBy) {
+        const sortOrder = searchFilters.sortOrder === "desc" ? { ascending: false } : { ascending: true }
+        
+        switch (searchFilters.sortBy) {
+          case "name":
+            query = query.order("original_name", sortOrder)
+            break
+          case "size":
+            query = query.order("size", sortOrder)
+            break
+          case "date":
+            query = query.order("created_at", sortOrder)
+            break
+          case "type":
+            query = query.order("mime_type", sortOrder)
+            break
+          default:
+            query = query.order("created_at", { ascending: false })
+        }
+      } else {
+        // Default sorting by creation date
+        query = query.order("created_at", { ascending: false })
+      }
+    } else {
+      // No search - default sorting by creation date
+      query = query.order("created_at", { ascending: false })
+    }
+
+    const { data: files, error } = await query
 
     if (error) {
       console.error(`[${req.requestId}] Supabase error:`, error)
@@ -129,7 +206,10 @@ router.get("/", async (req, res) => {
       ip_address: req.clientIP,
       user_agent: req.get("User-Agent"),
       success: true,
-      details: { count: files.length },
+      details: { 
+        count: files.length,
+        searchQuery: searchQuery || null
+      },
       created_at: new Date().toISOString(),
     })
 
